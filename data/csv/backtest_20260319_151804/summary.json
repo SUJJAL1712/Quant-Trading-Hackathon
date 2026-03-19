@@ -1,0 +1,18 @@
+{
+  "status": "OK",
+  "run_id": "20260319_151804",
+  "start": "2024-09-15",
+  "end": "2025-03-15",
+  "initial_capital": 100000.0,
+  "final_nav": 169534.47,
+  "total_return_pct": 69.53,
+  "sortino": 0.0296,
+  "sharpe": 0.0238,
+  "calmar": 0.0004,
+  "composite_score": 0.0191,
+  "max_drawdown_pct": 36.56,
+  "rebalance_count": 1087,
+  "total_trades": 2018,
+  "total_commission": 1507.86,
+  "n_coins": 20
+}

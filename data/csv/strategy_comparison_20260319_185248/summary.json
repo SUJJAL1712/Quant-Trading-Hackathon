@@ -1,0 +1,15 @@
+{
+  "run_id": "20260319_185248",
+  "strategies": [
+    "baseline",
+    "tsmom_only"
+  ],
+  "periods": [
+    "Q4_2024"
+  ],
+  "frequencies": [
+    2,
+    4
+  ],
+  "total_runs": 4,
+  "successful_runs": 

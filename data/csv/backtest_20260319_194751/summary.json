@@ -1,0 +1,96 @@
+{
+  "status": "OK",
+  "run_id": "20260319_194751",
+  "start": "2025-01-01",
+  "end": "2025-03-15",
+  "rebalance_hours": 2,
+  "adaptive": true,
+  "initial_capital": 100000.0,
+  "final_nav": 73525.73,
+  "total_return_pct": -26.47,
+  "sortino": -0.0396,
+  "sharpe": -0.0377,
+  "calmar": -0.0005,
+  "composite_score": -0.0273,
+  "max_drawdown_pct": 31.72,
+  "rebalance_count": 656,
+  "total_trades": 655,
+  "total_commission": 245.02,
+  "n_coins": 46,
+  "adaptive_diagnostics": {
+    "ic_ir": {
+      "0": {
+        "momentum": -0.1451,
+        "breakout": -0.1743,
+        "volume_momentum": -0.2865,
+        "mean_reversion": 0.151,
+        "relative_strength": -0.1825
+      },
+      "1": {
+        "momentum": -0.2802,
+        "breakout": -0.2369,
+        "volume_momentum": -0.1772,
+        "mean_reversion": -0.08,
+        "relative_strength": -0.3124
+      },
+      "2": {
+        "momentum": -0.2294,
+        "breakout": -0.0305,
+        "volume_momentum": -0.2174,
+        "mean_reversion": 0.3287,
+        "relative_strength": -0.2131
+      }
+    },
+    "mean_ic": {
+      "0": {
+        "momentum": -0.0309,
+        "breakout": -0.0311,
+        "volume_momentum": -0.0661,
+        "mean_reversion": 0.0291,
+        "relative_strength": -0.0401
+      },
+      "1": {
+        "momentum": -0.0543,
+        "breakout": -0.0404,
+        "volume_momentum": -0.035,
+        "mean_reversion": -0.0137,
+        "relative_strength": -0.0548
+      },
+      "2": {
+        "momentum": -0.0468,
+        "breakout": -0.0058,
+        "volume_momentum": -0.0449,
+        "mean_reversion": 0.0515,
+        "relative_strength": -0.0391
+      }
+    },
+    "obs_count": {
+      "0": 285,
+      "1": 217,
+      "2": 594
+    },
+    "current_weights": {
+      "0": {
+        "momentum": 0.3598,
+        "breakout": 0.2396,
+        "volume_momentum": 0.1587,
+        "mean_reversion": 0.1226,
+        "relative_strength": 0.1193
+      },
+      "1": {
+        "momentum": 0.2791,
+        "breakout": 0.2002,
+        "volume_momentum": 0.1605,
+        "mean_reversion": 0.2011,
+        "relative_strength": 0.1591
+      },
+      "2": {
+        "momentum": 0.1622,
+        "breakout": 0.1235,
+        "volume_momentum": 0.1625,
+        "mean_reversion": 0.3073,
+        "relative_strength": 0.2445
+      }
+    }
+  }
+}

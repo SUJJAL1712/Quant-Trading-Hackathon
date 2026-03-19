@@ -1,0 +1,5 @@
+period,strategy,frequency_h,total_return_pct,max_drawdown_pct,sortino,sharpe,calmar,composite_score,total_trades,rebalance_count,total_commission,elapsed_sec
+Q4_2024,baseline,2,-4.77,10.33,-0.0063,-0.0125,-0.0002,-0.0063,176,161,70.42,208.5
+Q4_2024,tsmom_only,2,-2.37,5.48,-0.0049,-0.0095,-0.0002,-0.0049,91,161,38.17,254.4
+Q4_2024,baseline,4,-4.07,8.65,-0.006,-0.0117,-0.0002,-0.006,113,81,48.09,144.0
+Q4_2024,tsmom_only,4,-1.89,6.16,-0.0035,-0.0065,-0.0001,-0.0034,76,81,32.35,1268.2

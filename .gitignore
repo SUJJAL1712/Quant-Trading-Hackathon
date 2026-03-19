@@ -1,0 +1,36 @@
+# Data files
+data/csv/*.csv
+data/csv/*.json
+data/db/*.db
+data/bot_state.json
+*.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Environment
+.env
+
+# Logs
+logs/
+
+# Cache
+pytest-cache-files-*/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
+NUL
+nul
+
+# OS
+.DS_Store
+Thumbs.db
