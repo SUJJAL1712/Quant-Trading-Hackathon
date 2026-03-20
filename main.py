@@ -350,10 +350,8 @@ class TradingBot:
             if self._stop_cooldown[coin] <= 0:
                 del self._stop_cooldown[coin]
 
-        # Widen stop-loss in bear regime to avoid constant churn
-        stop_pct = cfg.RISK.position_stop_loss_pct
-        if regime == 2:
-            stop_pct = 0.20  # 20% in bear (wider to avoid churn)
+        # ATR-based dynamic stop-losses (pass returns for per-asset vol computation)
+        stop_pct = cfg.RISK.position_stop_loss_pct  # fallback only
 
         # Only check positions not on cooldown
         check_coins = {c for c in holdings if c not in self._stop_cooldown}
@@ -361,6 +359,7 @@ class TradingBot:
             {f"{c}/USD": prices.get(f"{c}/USD", 0) for c in check_coins},
             {f"{c}/USD": self.state.get("entry_prices", {}).get(c, 0) for c in check_coins},
             stop_pct_override=stop_pct,
+            returns=returns,
         )
         stopped_coins = []
         if stopped:
@@ -1055,15 +1054,14 @@ class BacktestEngine:
                 if self._stop_cooldown[coin] <= 0:
                     del self._stop_cooldown[coin]
 
-            # Check position stops (only for held positions, not on cooldown)
-            # Widen stop-loss in bear regime to avoid constant churn
-            stop_pct = cfg.RISK.position_stop_loss_pct
-            if regime == 2:
-                stop_pct = 0.20  # 20% in bear (wider to avoid churn)
+            # Check position stops — ATR-based dynamic stops
+            # (pass lookback_returns so RiskManager can compute per-asset vol)
+            stop_pct = cfg.RISK.position_stop_loss_pct  # fallback only
             check_prices = {coin: current_prices.get(coin, 0)
                            for coin in self.holdings if coin not in self._stop_cooldown}
             stopped = self.risk_mgr.check_position_stops(
-                check_prices, self.entry_prices, stop_pct_override=stop_pct)
+                check_prices, self.entry_prices, stop_pct_override=stop_pct,
+                returns=lookback_returns)
             for coin in stopped:
                 if coin in alpha_scores.index:
                     alpha_scores[coin] = -10.0

@@ -120,25 +120,70 @@ class RiskManager:
             return 0.0
         return -float(tail.mean())
 
+    def compute_dynamic_stop(self, coin: str, returns: pd.DataFrame) -> float:
+        """Compute ATR-based dynamic stop distance for a single asset.
+
+        Uses realized volatility as a proxy for ATR (since we may only have
+        close prices). During high-vol regimes, stops widen to avoid cascade
+        liquidations. During calm periods, stops tighten for capital protection.
+
+        Formula:
+            stop = clamp(k × RV_24h, floor, ceiling)
+            RV_24h = std(returns[-N:]) × sqrt(N)
+
+        Returns:
+            Stop distance as a fraction (e.g., 0.10 = 10%)
+        """
+        if coin not in returns.columns:
+            return cfg.RISK.position_stop_loss_pct  # fallback
+
+        coin_returns = returns[coin].dropna()
+        N = cfg.RISK.atr_lookback_hours
+        if len(coin_returns) < max(N, 6):
+            return cfg.RISK.position_stop_loss_pct  # fallback
+
+        # Realized volatility over the lookback window
+        recent = coin_returns.iloc[-N:]
+        rv = float(recent.std() * np.sqrt(N))
+
+        # Scale by multiplier and clamp to floor/ceiling
+        stop = cfg.RISK.atr_stop_multiplier * rv
+        stop = np.clip(stop, cfg.RISK.atr_stop_floor, cfg.RISK.atr_stop_ceiling)
+        return float(stop)
+
     def check_position_stops(self, current_prices: Dict[str, float],
                              entry_prices: Dict[str, float],
-                             stop_pct_override: float = None) -> List[str]:
-        """Check per-position trailing stop-losses.
+                             stop_pct_override: float = None,
+                             returns: pd.DataFrame = None) -> List[str]:
+        """Check per-position trailing stop-losses (ATR-based when possible).
+
+        If returns data is provided, computes dynamic ATR-based stop distances
+        per asset. Otherwise falls back to the fixed stop_pct_override or
+        default config value.
 
         Args:
             current_prices: Current prices per coin
             entry_prices: Entry prices per coin
             stop_pct_override: Override the default stop-loss percentage
+            returns: Historical return DataFrame for ATR computation
 
         Returns:
             List of coins that triggered stop-loss
         """
         stopped = []
-        stop_pct = stop_pct_override or cfg.RISK.position_stop_loss_pct
+        default_stop = stop_pct_override or cfg.RISK.position_stop_loss_pct
 
         for coin, current in current_prices.items():
             if coin not in entry_prices or current <= 0:
                 continue
+
+            # Compute per-asset dynamic stop distance
+            # Extract base coin name (handle "BTC/USD" -> "BTC" or just "BTC")
+            base_coin = coin.split("/")[0] if "/" in coin else coin
+            if returns is not None and not returns.empty:
+                stop_pct = self.compute_dynamic_stop(base_coin, returns)
+            else:
+                stop_pct = default_stop
 
             # Update high water mark for this position
             if coin not in self.position_hwm:
@@ -149,8 +194,9 @@ class RiskManager:
             hwm = self.position_hwm[coin]
             dd = (hwm - current) / hwm
             if dd >= stop_pct:
-                logger.warning("Stop-loss triggered for %s: %.1f%% from HWM (%.2f -> %.2f)",
-                               coin, dd * 100, hwm, current)
+                logger.warning("Stop-loss triggered for %s: %.1f%% from HWM (%.2f -> %.2f) "
+                               "[dynamic stop=%.1f%%]",
+                               coin, dd * 100, hwm, current, stop_pct * 100)
                 stopped.append(coin)
 
         return stopped
