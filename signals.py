@@ -1,21 +1,17 @@
 """
 Signal Engine -- Crypto Alpha Signals
 ======================================
-6 alpha signals combined via weighted z-scores.
+5 alpha signals combined via weighted z-scores.
 Trend-based regime detection (replaces HMM -- see test_hmm_regimes.py for why).
 
 Signal stack (research-backed for crypto):
-1. Momentum -- strongest factor in crypto. Multi-timeframe.
-2. Breakout -- price vs N-period high/low range.
-3. VolumeMomentum -- momentum confirmed by volume.
-4. MeanReversion -- short-term oversold with RSI confirmation.
-5. RelativeStrength -- performance vs BTC benchmark.
-6. ResidualMomentum -- idiosyncratic trend after removing BTC beta.
+1. Momentum (35%) -- strongest factor in crypto. Multi-timeframe.
+2. Breakout (20%) -- price vs N-period high/low range.
+3. VolumeMomentum (15%) -- momentum confirmed by volume.
+4. MeanReversion (15%) -- short-term oversold with volume confirmation.
+5. RelativeStrength (15%) -- performance vs BTC benchmark.
 
-Research-driven portfolio hygiene:
-- Prefer liquid names over thin names.
-- Require minimum live history before a coin becomes tradable.
-- Reduce exposure to market-beta-only momentum by using residual momentum.
+Regime detection: price-trend-based on BTC (SMA slope + position).
 """
 
 import logging
@@ -26,7 +22,6 @@ import pandas as pd
 from scipy import stats
 
 import config as cfg
-from regime_models import FeatureScoreRegimeDetector, UnsupervisedFeatureRegimeDetector
 
 logger = logging.getLogger(__name__)
 
@@ -255,108 +250,43 @@ class RelativeStrengthSignal:
         return zscore(scores)
 
 
-class ResidualMomentumSignal:
-    """Residual momentum after removing market beta.
-
-    Inspired by residual-momentum research: rank coins on the persistence of
-    idiosyncratic returns, not raw market-beta-heavy returns. In crypto this is
-    useful because broad beta swings can dominate short-horizon rankings.
-    """
-
-    @staticmethod
-    def generate(prices: pd.DataFrame, benchmark: str = None,
-                 lookback: int = None, skip: int = None) -> pd.Series:
-        benchmark = benchmark or cfg.BENCHMARK
-        lookback = lookback or cfg.SIGNALS.residual_momentum_lookback
-        skip = cfg.SIGNALS.momentum_skip if skip is None else skip
-
-        if benchmark not in prices.columns or len(prices) < lookback + skip:
-            return pd.Series(0.0, index=prices.columns)
-
-        p = prices.iloc[:-skip] if skip > 0 else prices
-        rets = np.log(p / p.shift(1)).iloc[-lookback:]
-        if rets.empty or benchmark not in rets.columns:
-            return pd.Series(0.0, index=prices.columns)
-
-        market = rets[benchmark].dropna()
-        if len(market) < max(24, lookback // 4):
-            return pd.Series(0.0, index=prices.columns)
-
-        scores = {}
-        for coin in prices.columns:
-            if coin == benchmark:
-                scores[coin] = 0.0
-                continue
-
-            coin_ret = rets[coin].dropna()
-            common = coin_ret.index.intersection(market.index)
-            if len(common) < max(24, lookback // 4):
-                scores[coin] = 0.0
-                continue
-
-            y = coin_ret.loc[common]
-            x = market.loc[common]
-            x_var = x.var()
-            if not np.isfinite(x_var) or x_var < 1e-12:
-                beta = 0.0
-            else:
-                beta = y.cov(x) / x_var
-                if not np.isfinite(beta):
-                    beta = 0.0
-
-            alpha_hat = y.mean() - beta * x.mean()
-            residual = y - (alpha_hat + beta * x)
-            resid_std = residual.std()
-            if not np.isfinite(resid_std) or resid_std < 1e-8:
-                scores[coin] = 0.0
-                continue
-
-            # T-stat-like ranking favors persistent residual trends over noisy spikes.
-            scores[coin] = residual.sum() / (resid_std * np.sqrt(len(residual)))
-
-        return zscore(pd.Series(scores).reindex(prices.columns, fill_value=0.0))
-
-
 # -- Regime Detection --
 
 class TrendRegimeDetector:
-    """Enhanced trend-based regime detection on BTC + market breadth.
+    """Price-trend-based regime detection on BTC.
 
-    Uses BTC price action plus cross-asset breadth signals for
-    faster and more accurate regime identification.
+    Replaces HMM which was useless on hourly returns (stays in one state
+    93-98% of the time -- see test_hmm_regimes.py).
 
-    Signals:
-    1. BTC price vs 7-day and 3-day SMA
-    2. SMA slope (trend direction)
+    Regime is determined by:
+    1. BTC price position vs 168h (7-day) SMA
+    2. SMA slope (rate of change over 24h)
     3. Drawdown from recent high
-    4. Short-term momentum (24h)
-    5. Medium-term momentum (72h) — catches sustained moves
-    6. Market breadth (fraction of coins above their own 3-day SMA)
-    7. Realized volatility spike detection
 
     States:
-    - BULL (0): Strong uptrend with positive breadth
+    - BULL (0): Price > SMA AND SMA slope > 0
     - NEUTRAL (1): Mixed signals
-    - BEAR (2): Downtrend with negative breadth or drawdown
+    - BEAR (2): Price < SMA AND SMA slope < 0 OR drawdown > 10%
     """
 
     def __init__(self, rebalance_hours: int = None):
         self._current_regime = 1  # default: Neutral
         self._regime_history = []
         self._regime_hold_count = 0
+        # Minimum cycles before regime can change (~24h worth of cycles)
         freq = rebalance_hours or cfg.REBALANCE.frequency_hours
-        self._MIN_HOLD = max(2, 16 // freq)  # ~16h hysteresis (was 8h)
-        # Re-risk cooldown: after leaving BEAR, require extra hold before BULL
-        self._RERISK_COOLDOWN = max(1, 12 // freq)  # 12h cooldown (was 24h)
-        self._bear_exit_count = 0  # cycles since last BEAR exit
-        self._was_bear = False     # track if we were recently in BEAR
+        self._MIN_HOLD = max(1, 24 // freq)
 
-    def detect(
-        self,
-        prices: pd.DataFrame,
-        benchmark: str = None,
-        volumes: pd.DataFrame = None,
-    ) -> int:
+    def detect(self, prices: pd.DataFrame, benchmark: str = None) -> int:
+        """Detect current market regime from BTC price action.
+
+        Args:
+            prices: Close price DataFrame (time x coins)
+            benchmark: Benchmark coin (default: BTC)
+
+        Returns:
+            Regime index: 0=Bull, 1=Neutral, 2=Bear
+        """
         benchmark = benchmark or cfg.BENCHMARK
 
         if benchmark not in prices.columns or len(prices) < 168:
@@ -369,142 +299,95 @@ class TrendRegimeDetector:
         sma_168 = compute_sma(btc, 168)  # 7-day
         sma_72 = compute_sma(btc, 72)    # 3-day
         current_price = btc.iloc[-1]
+        current_sma168 = sma_168.iloc[-1]
+        current_sma72 = sma_72.iloc[-1]
 
-        above_7d_sma = current_price > sma_168.iloc[-1]
-        above_3d_sma = current_price > sma_72.iloc[-1]
+        above_7d_sma = current_price > current_sma168
+        above_3d_sma = current_price > current_sma72
 
         # 2. SMA slope (24h rate of change)
-        sma_slope = (sma_168.iloc[-1] / sma_168.iloc[-24] - 1) if len(sma_168) >= 24 else 0
+        if len(sma_168) >= 24:
+            sma_slope = (sma_168.iloc[-1] / sma_168.iloc[-24] - 1)
+        else:
+            sma_slope = 0
 
         # 3. Drawdown from 14-day high
-        recent_high = btc.iloc[-336:].max() if len(btc) >= 336 else btc.max()
+        if len(btc) >= 336:
+            recent_high = btc.iloc[-336:].max()
+        else:
+            recent_high = btc.max()
         drawdown = (recent_high - current_price) / recent_high if recent_high > 0 else 0
 
-        # 4. Short-term momentum (24h)
-        short_mom = (btc.iloc[-1] / btc.iloc[-24] - 1) if len(btc) >= 24 else 0
+        # 4. Short-term momentum (24h return)
+        if len(btc) >= 24:
+            short_mom = btc.iloc[-1] / btc.iloc[-24] - 1
+        else:
+            short_mom = 0
 
-        # 5. Medium-term momentum (72h) — catches sustained declines
-        med_mom = (btc.iloc[-1] / btc.iloc[-72] - 1) if len(btc) >= 72 else 0
-
-        # 6. Market breadth — fraction of coins above their 3-day SMA
-        breadth = 0.5
-        if len(prices) >= 72 and len(prices.columns) >= 5:
-            sma_72_all = prices.rolling(72, min_periods=36).mean()
-            breadth = float((prices.iloc[-1] > sma_72_all.iloc[-1]).mean())
-
-        # 7. Realized vol (24h) — spike detection
-        btc_ret = np.log(btc / btc.shift(1))
-        vol_24h = float(btc_ret.iloc[-24:].std()) if len(btc_ret) >= 24 else 0.01
-        vol_168h = float(btc_ret.iloc[-168:].std()) if len(btc_ret) >= 168 else vol_24h
-        vol_spike = vol_24h > 1.5 * vol_168h  # vol 50% above normal
-
-        # Decision logic — weighted signal combination
+        # Decision logic
         bull_signals = 0
         bear_signals = 0
 
-        # SMA position (2 signals)
         if above_7d_sma:
             bull_signals += 1
         else:
             bear_signals += 1
+
         if above_3d_sma:
             bull_signals += 1
         else:
             bear_signals += 1
 
-        # SMA slope
-        if sma_slope > 0.001:
+        if sma_slope > 0.001:  # SMA rising
             bull_signals += 1
-        elif sma_slope < -0.001:
+        elif sma_slope < -0.001:  # SMA falling
             bear_signals += 1
 
-        # Drawdown (weighted more heavily)
-        if drawdown > 0.12:
-            bear_signals += 2  # strong bear
-        elif drawdown > 0.06:
+        if drawdown > 0.10:  # 10% drawdown = bear
+            bear_signals += 2
+        elif drawdown > 0.05:
             bear_signals += 1
 
-        # Short-term momentum
-        if short_mom > 0.02:
+        if short_mom > 0.02:  # +2% in 24h
             bull_signals += 1
-        elif short_mom < -0.03:
+        elif short_mom < -0.03:  # -3% in 24h
             bear_signals += 1
 
-        # Medium-term momentum (72h) — NEW: catches sustained moves
-        if med_mom > 0.05:
-            bull_signals += 1
-        elif med_mom < -0.05:
-            bear_signals += 1
-        elif med_mom < -0.03:
-            bear_signals += 0.5
-
-        # Market breadth — NEW: cross-sectional confirmation
-        if breadth > 0.65:
-            bull_signals += 1
-        elif breadth < 0.35:
-            bear_signals += 1
-        elif breadth < 0.45:
-            bear_signals += 0.5
-
-        # Volatility spike — NEW: high vol → defensive tilt
-        if vol_spike and drawdown > 0.03:
-            bear_signals += 0.5
-
-        # Classify raw signal — balanced thresholds (was asymmetric, caused bear bias)
-        if bear_signals >= 3.5:   # need strong confirmation for bear (was 2.5)
-            raw_regime = 2
-        elif bull_signals >= 3.0:  # moderate proof for bull (was 3.5)
-            raw_regime = 0
+        # Classify raw signal
+        if bear_signals >= 3:
+            raw_regime = 2  # Bear
+        elif bull_signals >= 3:
+            raw_regime = 0  # Bull
         else:
-            raw_regime = 1
+            raw_regime = 1  # Neutral
 
-        # Re-risk gate: after being in BEAR, require stronger proof before BULL
-        # Must have: BTC above 7d SMA, breadth > 0.60, positive 72h momentum
-        if self._was_bear and self._bear_exit_count < self._RERISK_COOLDOWN:
-            self._bear_exit_count += 1
-            rerisk_ok = (above_7d_sma and breadth > 0.55 and med_mom > 0.01)
-            if raw_regime == 0 and not rerisk_ok:
-                raw_regime = 1  # demote to NEUTRAL until conditions met
-                logger.info("Re-risk gate: BULL blocked (cooldown %d/%d, breadth=%.2f, med_mom=%.3f)",
-                            self._bear_exit_count, self._RERISK_COOLDOWN, breadth, med_mom)
-
-        # Hysteresis with crash-fast override
+        # Hysteresis: require _MIN_HOLD cycles before allowing regime change,
+        # UNLESS transitioning to BEAR with strong conviction (crash override)
         self._regime_hold_count += 1
         if raw_regime != self._current_regime:
-            # Crash override: immediate BEAR only on very strong signals
-            crash_override = (raw_regime == 2 and bear_signals >= 4.5)
+            crash_override = (raw_regime == 2 and bear_signals >= 4)
             if crash_override or self._regime_hold_count >= self._MIN_HOLD:
+                # Allow transition — but prefer stepping through NEUTRAL
+                # (BULL->BEAR or BEAR->BULL goes through NEUTRAL first)
                 prev = self._current_regime
-                # Track BEAR exits for re-risk cooldown
-                if prev == 2 and raw_regime != 2:
-                    self._was_bear = True
-                    self._bear_exit_count = 0
-                if raw_regime == 2:
-                    self._was_bear = False  # entering bear, reset
-                # Step through NEUTRAL unless crash override
                 if abs(raw_regime - prev) == 2 and not crash_override:
-                    regime = 1
+                    regime = 1  # step through Neutral
                 else:
                     regime = raw_regime
                 self._current_regime = regime
                 self._regime_hold_count = 0
             else:
-                regime = self._current_regime
+                regime = self._current_regime  # hold current regime
         else:
             regime = self._current_regime
-            # Clear re-risk cooldown once we've been in BULL for enough cycles
-            if regime == 0 and self._was_bear:
-                self._bear_exit_count += 1
-                if self._bear_exit_count >= self._RERISK_COOLDOWN:
-                    self._was_bear = False
 
         self._regime_history.append(regime)
 
         regime_names = {0: "BULL", 1: "NEUTRAL", 2: "BEAR"}
-        logger.info("Regime: %s (raw=%s, bull=%.1f, bear=%.1f, slope=%.4f, DD=%.1f%%, breadth=%.2f)",
+        logger.info("Regime: %s (raw=%s, bull=%d, bear=%d, slope=%.4f, DD=%.1f%%, hold=%d)",
                      regime_names[regime], regime_names[raw_regime],
                      bull_signals, bear_signals,
-                     sma_slope, drawdown * 100, breadth)
+                     sma_slope, drawdown * 100, self._regime_hold_count)
 
         return regime
 
@@ -559,18 +442,17 @@ class AdaptiveSignalWeighter:
     to +/- 60% of base weight to prevent overfitting.
     """
 
-    # How much IC data can tilt weights beyond regime priors
-    # 0.20 was too conservative — signals with negative IC stayed heavily weighted
-    ADAPTATION_STRENGTH = 0.45
+    # How much IC data can tilt weights beyond regime priors (keep small -- IC is noisy)
+    ADAPTATION_STRENGTH = 0.20
 
-    # Minimum weight floor as fraction of base (allow signals to be nearly zeroed)
-    MIN_WEIGHT_FLOOR = 0.10
+    # Minimum weight floor as fraction of base (never go below 25% of base weight)
+    MIN_WEIGHT_FLOOR = 0.25
 
-    # Maximum weight ceiling as multiple of base
-    MAX_WEIGHT_CEIL = 2.5
+    # Maximum weight ceiling as multiple of base (never exceed 2x base weight)
+    MAX_WEIGHT_CEIL = 2.0
 
     # Minimum observations before adapting with IC data
-    MIN_OBS = 3
+    MIN_OBS = 5
 
     # IC history buffer size per regime (rolling window)
     IC_BUFFER_SIZE = 50
@@ -579,26 +461,22 @@ class AdaptiveSignalWeighter:
     SOFTMAX_TEMP = 4.0
 
     SIGNAL_NAMES = ["momentum", "breakout", "volume_momentum",
-                    "mean_reversion", "relative_strength", "residual_momentum"]
+                    "mean_reversion", "relative_strength"]
 
     # Empirical regime priors: which signals tend to work in which regime
     # Based on crypto factor research (momentum in bull, mean-rev in bear, etc.)
-    # Regime priors from empirical crypto research
     REGIME_PRIORS = {
         0: {  # Bull: momentum + breakout dominate
-            "momentum": 0.35, "breakout": 0.20, "volume_momentum": 0.10,
-            "mean_reversion": 0.05, "relative_strength": 0.10,
-            "residual_momentum": 0.20,
+            "momentum": 0.40, "breakout": 0.25,
+            "volume_momentum": 0.15, "mean_reversion": 0.10, "relative_strength": 0.10,
         },
         1: {  # Neutral: balanced
-            "momentum": 0.25, "breakout": 0.15, "volume_momentum": 0.10,
-            "mean_reversion": 0.15, "relative_strength": 0.15,
-            "residual_momentum": 0.20,
+            "momentum": 0.30, "breakout": 0.20,
+            "volume_momentum": 0.15, "mean_reversion": 0.20, "relative_strength": 0.15,
         },
         2: {  # Bear: mean-reversion + relative strength dominate
-            "momentum": 0.10, "breakout": 0.05, "volume_momentum": 0.10,
-            "mean_reversion": 0.25, "relative_strength": 0.20,
-            "residual_momentum": 0.30,
+            "momentum": 0.15, "breakout": 0.10,
+            "volume_momentum": 0.15, "mean_reversion": 0.35, "relative_strength": 0.25,
         },
     }
 
@@ -722,15 +600,9 @@ class AdaptiveSignalWeighter:
         exp_ir = np.exp(ir_shifted / max(self.SOFTMAX_TEMP, 0.1))
         ic_proportions = exp_ir / exp_ir.sum()
 
-        # Build weights: regime prior (dominant) + IC tilt
-        # Bear regime gets stronger adaptation (cut bad signals faster)
-        if regime == 2:
-            adapt_strength = min((obs - self.MIN_OBS) / 15.0, 0.55)
-            floor_mult = 0.05   # allow near-zero for bad signals in bear
-        else:
-            adapt_strength = min((obs - self.MIN_OBS) / 20.0, self.ADAPTATION_STRENGTH)
-            floor_mult = self.MIN_WEIGHT_FLOOR
-        data_confidence = adapt_strength
+        # Build weights: regime prior (dominant) + small IC tilt
+        # data_confidence maxes out at ADAPTATION_STRENGTH (0.20)
+        data_confidence = min((obs - self.MIN_OBS) / 20.0, self.ADAPTATION_STRENGTH)
         raw_weights = {}
         for i, name in enumerate(self.SIGNAL_NAMES):
             base_w = self.base_weights.get(name, 0.15)
@@ -740,7 +612,7 @@ class AdaptiveSignalWeighter:
             blended = (1 - data_confidence) * prior_w + data_confidence * ic_w
 
             # Floor and ceiling relative to base
-            blended = max(blended, floor_mult * base_w)
+            blended = max(blended, self.MIN_WEIGHT_FLOOR * base_w)
             blended = min(blended, self.MAX_WEIGHT_CEIL * base_w)
 
             raw_weights[name] = blended
@@ -809,9 +681,8 @@ class AlphaEngine:
     Regime tilt: applied as overlay after signal combination.
     """
 
-    def __init__(self, adaptive: bool = True, rebalance_hours: int = None,
-                 regime_detector=None):
-        self.regime_detector = regime_detector or self._build_regime_detector(rebalance_hours)
+    def __init__(self, adaptive: bool = True, rebalance_hours: int = None):
+        self.regime_detector = TrendRegimeDetector(rebalance_hours=rebalance_hours)
         self.base_weights = cfg.SIGNALS.factor_weights
         self.adaptive = adaptive
         self.signal_weighter = AdaptiveSignalWeighter(self.base_weights)
@@ -820,73 +691,6 @@ class AlphaEngine:
         # Store previous cycle's signals for IC computation
         self._prev_signal_scores: Optional[Dict[str, pd.Series]] = None
         self._prev_regime: Optional[int] = None
-
-    @staticmethod
-    def _build_regime_detector(rebalance_hours: int = None):
-        model = str(getattr(cfg.SIGNALS, "regime_model", "legacy_trend")).lower()
-        feature_set = getattr(cfg.SIGNALS, "regime_feature_set", "market")
-        n_components = getattr(cfg.SIGNALS, "regime_n_components", 4)
-        train_hours = getattr(cfg.SIGNALS, "regime_train_hours", 24 * 90)
-        retrain_hours = getattr(cfg.SIGNALS, "regime_retrain_hours", 24)
-
-        if model == "feature_hmm":
-            return UnsupervisedFeatureRegimeDetector(
-                model_kind="hmm",
-                feature_set=feature_set,
-                n_components=n_components,
-                rebalance_hours=rebalance_hours,
-                train_hours=train_hours,
-                retrain_hours=retrain_hours,
-            )
-        if model == "feature_gmm":
-            return UnsupervisedFeatureRegimeDetector(
-                model_kind="gmm",
-                feature_set=feature_set,
-                n_components=n_components,
-                rebalance_hours=rebalance_hours,
-                train_hours=train_hours,
-                retrain_hours=retrain_hours,
-            )
-        if model == "score":
-            return FeatureScoreRegimeDetector(
-                feature_set=feature_set,
-                rebalance_hours=rebalance_hours,
-                train_hours=train_hours,
-            )
-        return TrendRegimeDetector(rebalance_hours=rebalance_hours)
-
-    def _liquidity_mask(self, prices: pd.DataFrame,
-                        volumes: Optional[pd.DataFrame]) -> pd.Series:
-        """Keep only sufficiently liquid coins eligible for long exposure."""
-        liquid = pd.Series(True, index=prices.columns, dtype=bool)
-        if volumes is None or volumes.empty or prices.empty:
-            return liquid
-
-        common = prices.columns.intersection(volumes.columns)
-        if len(common) == 0:
-            return liquid
-
-        lookback = min(cfg.SIGNALS.liquidity_lookback_hours, len(prices), len(volumes))
-        if lookback < 4:
-            return liquid
-
-        recent_prices = prices[common].iloc[-lookback:]
-        recent_volumes = volumes[common].iloc[-lookback:]
-        dollar_volume = (recent_prices * recent_volumes).mean()
-        dollar_volume = dollar_volume.replace([np.inf, -np.inf], np.nan).dropna()
-        if dollar_volume.empty:
-            return liquid
-
-        cutoff = dollar_volume.quantile(cfg.SIGNALS.liquidity_filter_quantile)
-        keep = dollar_volume[dollar_volume >= cutoff].index
-        liquid.loc[common] = False
-        liquid.loc[keep] = True
-        return liquid
-
-    def _history_mask(self, prices: pd.DataFrame) -> pd.Series:
-        """Require a minimum number of real observations before trading a coin."""
-        history = prices.notna().sum()
-        return history >= cfg.SIGNALS.min_history_hours
 
     def compute_alpha(self, prices: pd.DataFrame, returns: pd.DataFrame,
                       volumes: pd.DataFrame = None) -> pd.Series:
@@ -904,7 +708,7 @@ class AlphaEngine:
 
         # Detect regime first (needed for adaptive weights)
         try:
-            regime = self.regime_detector.detect(prices, volumes=volumes)
+            regime = self.regime_detector.detect(prices)
         except Exception as e:
             logger.warning("Regime detection failed: %s", e)
             regime = 1
@@ -970,14 +774,6 @@ class AlphaEngine:
         except Exception as e:
             logger.warning("Relative strength signal failed: %s", e)
 
-        # 6. Residual momentum signal
-        try:
-            rmom = ResidualMomentumSignal.generate(prices)
-            signal_scores["residual_momentum"] = rmom
-            alpha += weights.get("residual_momentum", 0.15) * rmom.reindex(coins, fill_value=0)
-        except Exception as e:
-            logger.warning("Residual momentum signal failed: %s", e)
-
         # Store for next cycle's IC computation
         self._prev_signal_scores = signal_scores
         self._prev_regime = regime
@@ -989,48 +785,18 @@ class AlphaEngine:
         except Exception as e:
             logger.warning("Regime tilt failed: %s", e)
 
-        # Apply trend filter: dampen alpha for coins below 7-day SMA
+        # Apply trend filter: zero alpha if below 7-day SMA
         if cfg.SIGNALS.trend_filter and len(prices) >= cfg.SIGNALS.trend_filter_ma:
             sma = compute_sma(prices, cfg.SIGNALS.trend_filter_ma)
             below_trend = prices.iloc[-1] < sma.iloc[-1]
-            if regime == 2:  # Bear: strong dampening
+            if regime == 2:  # Bear
                 alpha[below_trend] = -1.0
             else:
                 alpha[below_trend] *= 0.1
 
-        # Bear quality filter: in BEAR only, softly penalize meme/speculative.
-        # Don't hard-cap — just apply a multiplier so they rank lower but
-        # can still be held if alpha is strong enough.
-        if regime == 2:
-            MEME_SECTOR = {"Meme"}
-
-            for coin in coins:
-                sector = cfg.SECTOR_MAP.get(coin, "Other")
-                if sector in MEME_SECTOR:
-                    alpha[coin] = alpha.get(coin, 0) * 0.5  # halve meme alpha in bear
-                elif sector in {"DeSci", "Identity", "Privacy"}:
-                    alpha[coin] = alpha.get(coin, 0) * 0.7  # reduce speculative alpha
-
         # Final z-score
         alpha = zscore(alpha)
-
-        # History and liquidity gating: illiquid or too-new names should not rank
-        # above established, liquid coins in a long-only portfolio.
-        history_ok = self._history_mask(prices)
-        liquid_ok = self._liquidity_mask(prices, volumes)
-        not_eligible = ~(history_ok & liquid_ok)
-        if not_eligible.any():
-            alpha.loc[not_eligible] = alpha.loc[not_eligible].clip(upper=0.0)
-
         return alpha
-
-    @staticmethod
-    def _get_breadth(prices: pd.DataFrame, period: int = 72) -> float:
-        """Get market breadth (fraction of coins above their SMA)."""
-        if len(prices) < period or len(prices.columns) < 5:
-            return 0.5
-        sma = prices.rolling(period, min_periods=period // 2).mean()
-        return float((prices.iloc[-1] > sma.iloc[-1]).mean())
 
     @property
     def current_regime(self) -> int:

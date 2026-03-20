@@ -95,10 +95,12 @@ Trend filter: zero alpha if price < 7-day SMA (168 hours).
 
 ## Risk Management
 
-- Drawdown tracking with HWM
-- Per-position trailing stops:
-  - Default: 12% from position HWM
-  - Bear regime: 20% (wider to avoid churn)
+- **Dynamic Risk Aversion (λ) Scaling**: BL risk aversion scales up when avg pairwise correlation spikes or drawdown grows, naturally suppressing position sizes without forced liquidation
+  - Formula: `λ_eff = λ_base × (1 + κ × max(0, ρ_avg - ρ_threshold)) × (1 + δ × DD_scaling)`
+  - λ_base=2.5, κ=15.0, ρ_threshold=0.50, δ=3.0
+- **Enhanced Volatility Targeting**: 40% annualized target vol, capped at 1.0x (never lever up), uses EWMA covariance (30% recent 24h blend) for faster crash responsiveness
+- **ATR-Based Dynamic Stop-Losses**: Per-asset stops scale with realized vol: `stop = clamp(2.5 × RV_24h, 5%, 25%)`. Naturally widens in high-vol regimes to prevent cascade liquidations
+- Drawdown tracking with HWM + drawdown deleveraging (linear 1.0→0.3 between 12%-22% DD)
 - **Stop-loss cooldown**: 6-cycle (24h) re-entry cooldown after stop-loss trigger
   - HWM resets on stop-out so re-entry starts fresh
   - Coins on cooldown get alpha clamped to -1.0 (prevents re-entry)
@@ -183,10 +185,7 @@ Composite score: 0.4 × Sortino + 0.3 × Sharpe + 0.3 × Calmar
 
 ## Known Limitations / TODO
 
-- ~~Stop-loss cooldown is only in BacktestEngine~~ — DONE: ported to live TradingBot + persisted to bot_state.json
+- Stop-loss cooldown is only in BacktestEngine — needs porting to live TradingBot.run_rebalance_cycle()
 - BULL regime rarely accumulates enough IC observations (regime detector spends most time in NEUTRAL)
-- ~~Roostoo API credentials not yet configured~~ — DONE: .env configured, early validation added
-- ~~Live bot not tested~~ — DONE: API connectivity verified (exchange running, 50 pairs available)
-- Retry logic added to roostoo_client.py (3 retries with 2/5/10s backoff)
-- Partial fills now tracked and logged in executor.py
-- State saved immediately after trade execution (before CSV logging)
+- Roostoo API credentials not yet configured (needs .env with ROOSTOO_API_KEY and ROOSTOO_API_SECRET)
+- Live bot (`python main.py`) not yet tested with real Roostoo API

@@ -15,7 +15,6 @@ from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
 
 import config as cfg
-from protective_allocation import ProtectiveAllocationEngine, ProtectiveAllocConfig
 
 logger = logging.getLogger(__name__)
 
@@ -183,24 +182,23 @@ class PortfolioOptimizer:
 
     # Regime-dependent blending ratios and invested targets
     REGIME_BLEND = {
-        0: {"bl_ratio": 0.80, "view_conf": 0.08, "vol_scale_range": (0.8, 1.8),
-            "target_invested": 0.85},   # Bull: maximize gains in uptrend
-        1: {"bl_ratio": 0.50, "view_conf": 0.05, "vol_scale_range": (0.5, 1.3),
-            "target_invested": 0.65},   # Neutral: moderate
-        2: {"bl_ratio": 0.10, "view_conf": 0.02, "vol_scale_range": (0.3, 0.8),
-            "target_invested": 0.50},   # Bear: mostly HRP for better diversification
+        0: {"bl_ratio": 0.80, "view_conf": 0.08, "vol_scale_range": (0.6, 1.5),
+            "target_invested": 0.70},   # Bull: confident but not reckless
+        1: {"bl_ratio": 0.50, "view_conf": 0.05, "vol_scale_range": (0.4, 1.2),
+            "target_invested": 0.45},   # Neutral: moderate
+        2: {"bl_ratio": 0.25, "view_conf": 0.02, "vol_scale_range": (0.2, 0.8),
+            "target_invested": 0.20},   # Bear: very defensive
     }
 
-    # Allocation smoothing: blend toward target weights instead of jumping
-    SMOOTHING_ALPHA = 0.55  # slightly faster than 0.5
+    # Asymmetric smoothing: delever fast, re-lever slowly
+    SMOOTHING_ALPHA_DELEVER = 0.80   # 80% toward target when reducing exposure
+    SMOOTHING_ALPHA_RELEVER = 0.30   # 30% toward target when increasing exposure
 
     def __init__(self):
         self._prev_weights = pd.Series(dtype=float)
-        self.protection_engine = ProtectiveAllocationEngine()
 
     def optimize(self, alpha_scores: pd.Series, returns: pd.DataFrame,
-                 regime: int = 1, current_drawdown: float = 0.0,
-                 prices: pd.DataFrame = None) -> Tuple[pd.Series, Dict]:
+                 regime: int = 1, current_drawdown: float = 0.0) -> Tuple[pd.Series, Dict]:
         """Run full optimization pipeline.
 
         Args:
@@ -221,54 +219,23 @@ class PortfolioOptimizer:
         if not common:
             return pd.Series(1.0 / len(coins), index=coins), {"error": "no matching returns"}
 
-        # Don't dropna(how='any') — that kills all rows whenever a single
-        # coin has a gap.  Instead, keep rows where at least half the coins
-        # have data, and let covariance / BL handle per-pair completeness.
-        ret = returns[common].dropna(how="all")
-        # Further filter: only keep coins with enough non-NaN rows to
-        # estimate covariance (at least 48 observations)
-        min_obs = min(48, max(len(ret) // 4, 10))
-        good_coins = [c for c in common if ret[c].notna().sum() >= min_obs]
-        if not good_coins:
-            good_coins = common  # fallback: use whatever we have
-        ret = ret[good_coins].dropna()
-        common = good_coins
+        ret = returns[common].dropna()
         alpha = alpha_scores.reindex(common, fill_value=0)
 
         # Get regime parameters
         params = self.REGIME_BLEND.get(regime, self.REGIME_BLEND[1])
         bl_ratio = params["bl_ratio"]
         view_conf = params["view_conf"]
-        vol_lo, vol_hi = params["vol_scale_range"]
+        vol_lo, _ = params["vol_scale_range"]
         target_invested = params["target_invested"]
 
-        # Protective allocation: compute stress-based cash shield
-        protection_result = {}
-        if prices is not None and not prices.empty:
-            protection_result = self.protection_engine.compute_protection(
-                prices=prices,
-                returns=ret,
-                current_drawdown=current_drawdown,
-                regime=regime,
-            )
-            # Scale target_invested by the protection multiplier
-            invested_mult = protection_result.get("invested_multiplier", 1.0)
-            target_invested *= invested_mult
-
-            # Floor: don't go below minimum
-            min_invested = self.protection_engine.config.min_invested_override
-            target_invested = max(target_invested, min_invested)
-
-        # Concentrate: keep top-N coins by alpha score.
-        # Don't filter to only positive alpha — the optimizer weights and
-        # target_invested scaling handle exposure. Filtering to positive-only
-        # causes extreme concentration (3-5 names) when most alphas are negative.
+        # Concentrate: only keep top-N coins by alpha score
         max_hold = cfg.CONSTRAINTS.max_holdings
-        min_hold = cfg.CONSTRAINTS.min_holdings
-        top_coins = alpha.nlargest(max(max_hold, min_hold))
-        # Ensure minimum diversification
-        if len(top_coins) < min_hold:
-            top_coins = alpha.nlargest(min_hold)
+        top_coins = alpha.nlargest(max_hold)
+        # Only include coins with positive alpha
+        top_coins = top_coins[top_coins > 0]
+        if len(top_coins) < cfg.CONSTRAINTS.min_holdings:
+            top_coins = alpha.nlargest(cfg.CONSTRAINTS.min_holdings)
 
         concentrated = [c for c in common if c in top_coins.index]
         if not concentrated:
@@ -277,11 +244,38 @@ class PortfolioOptimizer:
         ret_c = ret[concentrated]
         alpha_c = alpha.reindex(concentrated, fill_value=0)
 
-        # Covariance estimation (Ledoit-Wolf shrinkage)
+        # Covariance estimation (Ledoit-Wolf shrinkage + EWMA blend)
         cov = self._estimate_cov(ret_c)
 
-        # Black-Litterman weights
-        bl_weights = BlackLitterman.compute(alpha_c, cov, view_confidence=view_conf)
+        # ── Defense 1: Dynamic Risk Aversion (λ) Scaling ──
+        # Compute average pairwise correlation from the covariance matrix
+        n_assets = len(concentrated)
+        lambda_eff = cfg.RISK.lambda_base
+        avg_corr = 0.0
+        if n_assets >= 2:
+            stds = np.sqrt(np.diag(cov.values))
+            stds_outer = np.outer(stds, stds)
+            stds_outer = np.where(stds_outer > 0, stds_outer, 1e-10)
+            corr_matrix = cov.values / stds_outer
+            np.fill_diagonal(corr_matrix, 0)
+            avg_corr = corr_matrix.sum() / (n_assets * (n_assets - 1))
+
+            # Scale λ with correlation spike
+            corr_boost = max(0.0, avg_corr - cfg.RISK.lambda_corr_threshold)
+            lambda_eff *= (1.0 + cfg.RISK.lambda_corr_sensitivity * corr_boost)
+
+        # Scale λ with drawdown
+        dd_range = cfg.RISK.dd_deleverage_full - cfg.RISK.lambda_dd_start
+        if dd_range > 0 and current_drawdown > cfg.RISK.lambda_dd_start:
+            dd_boost = min((current_drawdown - cfg.RISK.lambda_dd_start) / dd_range, 1.0)
+            lambda_eff *= (1.0 + cfg.RISK.lambda_dd_sensitivity * dd_boost)
+
+        logger.info("Dynamic lambda: base=%.1f -> eff=%.1f (avg_corr=%.3f, DD=%.1f%%)",
+                    cfg.RISK.lambda_base, lambda_eff, avg_corr, current_drawdown * 100)
+
+        # Black-Litterman weights (with dynamic risk aversion)
+        bl_weights = BlackLitterman.compute(
+            alpha_c, cov, view_confidence=view_conf, risk_aversion=lambda_eff)
 
         # HRP weights
         hrp_weights = HierarchicalRiskParity.compute(ret_c)
@@ -298,38 +292,48 @@ class PortfolioOptimizer:
         if total > 0:
             combined = combined * (target_invested / total)
 
-        # Drawdown deleveraging — skip if protection is already handling DD
-        # (they both respond to drawdown, stacking them crushes exposure)
-        protection_active = protection_result.get("protection_score", 0.0) > 0.1
-        if cfg.RISK.drawdown_deleveraging and current_drawdown > cfg.RISK.dd_deleverage_start and not protection_active:
-            dd_range = cfg.RISK.dd_deleverage_full - cfg.RISK.dd_deleverage_start
-            if dd_range > 0:
-                deleverage = 1 - 0.7 * min((current_drawdown - cfg.RISK.dd_deleverage_start) / dd_range, 1.0)
-                deleverage = max(deleverage, 0.3)
+        # Drawdown deleveraging
+        if cfg.RISK.drawdown_deleveraging and current_drawdown > cfg.RISK.dd_deleverage_start:
+            dd_range_dl = cfg.RISK.dd_deleverage_full - cfg.RISK.dd_deleverage_start
+            if dd_range_dl > 0:
+                deleverage = 1 - 0.8 * min((current_drawdown - cfg.RISK.dd_deleverage_start) / dd_range_dl, 1.0)
+                deleverage = max(deleverage, 0.10)  # can go as low as 10% invested
                 combined *= deleverage
                 logger.info("Drawdown deleveraging: %.1f%% DD -> scale=%.2f",
                             current_drawdown * 100, deleverage)
 
-        # Volatility targeting
+        # ── Defense 2: Enhanced Volatility Targeting ──
+        # Cap at vol_scale_cap (1.0) — NEVER lever up, only delever
         if cfg.RISK.vol_scaling and not ret_c.empty:
             port_vol = self._portfolio_vol(combined, cov)
             if port_vol > 0:
                 target_vol = cfg.RISK.target_volatility / np.sqrt(365 * 24)  # hourly target
                 vol_scale = target_vol / port_vol
-                vol_scale = np.clip(vol_scale, vol_lo, vol_hi)
+                vol_scale = np.clip(vol_scale, vol_lo, cfg.RISK.vol_scale_cap)
                 combined *= vol_scale
 
         # Enforce constraints
         combined = self._enforce_constraints(combined)
 
-        # Allocation smoothing: blend from previous weights toward new target
+        # Asymmetric allocation smoothing: delever fast, re-lever slow
         if not self._prev_weights.empty:
             all_coins = combined.index.union(self._prev_weights.index)
             prev = self._prev_weights.reindex(all_coins, fill_value=0)
             curr = combined.reindex(all_coins, fill_value=0)
-            smoothed = (1 - self.SMOOTHING_ALPHA) * prev + self.SMOOTHING_ALPHA * curr
-            # Drop only truly negligible positions
-            smoothed = smoothed[smoothed > 0.002]
+
+            # Choose smoothing alpha based on direction of exposure change
+            prev_total = prev.sum()
+            curr_total = curr.sum()
+            if curr_total < prev_total:
+                # Derisking: move fast toward lower exposure
+                smooth_alpha = self.SMOOTHING_ALPHA_DELEVER
+            else:
+                # Re-levering: move slowly back into market
+                smooth_alpha = self.SMOOTHING_ALPHA_RELEVER
+
+            smoothed = (1 - smooth_alpha) * prev + smooth_alpha * curr
+            # Drop coins that are being exited (new target = 0 and prev < min threshold)
+            smoothed = smoothed[smoothed > 0.005]
             # Re-enforce constraints after smoothing (smoothing can reintroduce
             # old names and violate position/invested limits)
             combined = self._enforce_constraints(smoothed)
@@ -342,14 +346,16 @@ class PortfolioOptimizer:
             "n_positions": (combined > 0.01).sum(),
             "invested_pct": combined.sum(),
             "max_position": combined.max(),
-            "protection_score": protection_result.get("protection_score", 0.0),
-            "cash_fraction": protection_result.get("cash_fraction", 0.0),
         }
 
         return combined, diagnostics
 
     def _estimate_cov(self, returns: pd.DataFrame) -> pd.DataFrame:
-        """Estimate covariance matrix with Ledoit-Wolf shrinkage."""
+        """Estimate covariance matrix with Ledoit-Wolf shrinkage + EWMA blend.
+
+        Blends the full-sample shrunk covariance with a recent-24h covariance
+        to make the estimate more reactive to sudden vol regime changes.
+        """
         try:
             from sklearn.covariance import LedoitWolf
             lw = LedoitWolf().fit(returns.values)
@@ -358,6 +364,13 @@ class PortfolioOptimizer:
         except (ImportError, Exception) as e:
             logger.debug("LedoitWolf failed (%s), using sample cov", e)
             cov = returns.cov()
+
+        # EWMA blend: mix in recent 24h covariance for crash responsiveness
+        alpha = cfg.RISK.ewma_cov_alpha
+        if alpha > 0 and len(returns) >= 24:
+            recent_cov = returns.iloc[-24:].cov()
+            cov = (1 - alpha) * cov + alpha * recent_cov
+
         return cov
 
     def _portfolio_vol(self, weights: pd.Series, cov: pd.DataFrame) -> float:
@@ -378,7 +391,7 @@ class PortfolioOptimizer:
         cons = cfg.CONSTRAINTS
 
         # Remove near-zero weights
-        weights = weights[weights > 0.002].copy()
+        weights = weights[weights > 0.005].copy()
 
         if weights.empty:
             return weights
@@ -406,9 +419,8 @@ class PortfolioOptimizer:
             # Respect invested bounds
             if total > cons.max_invested_pct:
                 weights = weights * (cons.max_invested_pct / total)
-            # Don't force minimum investment — if the optimizer wants
-            # less than min_invested, let it (the target_invested scaling
-            # already set the desired level based on regime)
+            elif total < cons.min_invested_pct:
+                weights = weights * (cons.min_invested_pct / total)
 
             # Cap individual positions
             capped = weights > cons.max_single_position_pct

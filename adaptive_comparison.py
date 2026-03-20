@@ -96,10 +96,6 @@ def run_comparison():
 
     df = pd.DataFrame(results)
 
-    if df.empty:
-        logger.error("All backtest runs failed -- no results to compare.")
-        return
-
     # Print comparison
     logger.info("\n" + "=" * 80)
     logger.info("ADAPTIVE vs STATIC COMPARISON")

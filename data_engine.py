@@ -307,9 +307,7 @@ class DataEngine:
         prices = self.get_close_prices(coins, interval, days)
         if prices.empty:
             return prices
-        # Keep per-column NaNs instead of truncating the whole matrix to the
-        # newest asset's history.
-        returns = np.log(prices / prices.shift(1)).iloc[1:]
+        returns = np.log(prices / prices.shift(1)).dropna()
         return returns
 
     def get_volumes(self, coins: List[str] = None, interval: str = "1h",

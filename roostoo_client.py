@@ -16,10 +16,6 @@ import config as cfg
 
 logger = logging.getLogger(__name__)
 
-# Retry configuration for transient network failures
-MAX_RETRIES = 3
-RETRY_DELAYS = [2, 5, 10]  # seconds between retries (exponential-ish backoff)
-
 
 class RoostooClient:
     """REST client for Roostoo mock exchange API (v3)."""
@@ -54,65 +50,45 @@ class RoostooClient:
         ).hexdigest()
 
     def _get(self, endpoint: str, params: Dict = None, signed: bool = False) -> Dict:
-        """Send GET request with retry logic for transient failures."""
-        last_exc = None
-        for attempt in range(MAX_RETRIES):
-            params_copy = dict(params or {})
-            params_copy["timestamp"] = self._timestamp()  # fresh timestamp each attempt
-            headers = {}
-            if signed:
-                headers["MSG-SIGNATURE"] = self._sign(params_copy)
-            try:
-                resp = self.session.get(
-                    f"{self.base_url}{endpoint}",
-                    params=params_copy,
-                    headers=headers,
-                    timeout=15,
-                )
-                resp.raise_for_status()
-                return resp.json()
-            except requests.RequestException as e:
-                last_exc = e
-                if attempt < MAX_RETRIES - 1:
-                    delay = RETRY_DELAYS[attempt]
-                    logger.warning("GET %s attempt %d/%d failed: %s — retrying in %ds",
-                                   endpoint, attempt + 1, MAX_RETRIES, e, delay)
-                    time.sleep(delay)
-                else:
-                    logger.error("GET %s failed after %d attempts: %s",
-                                 endpoint, MAX_RETRIES, e)
-        raise last_exc
+        """Send signed GET request."""
+        params = params or {}
+        params["timestamp"] = self._timestamp()
+        headers = {}
+        if signed:
+            headers["MSG-SIGNATURE"] = self._sign(params)
+        try:
+            resp = self.session.get(
+                f"{self.base_url}{endpoint}",
+                params=params,
+                headers=headers,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as e:
+            logger.error("GET %s failed: %s", endpoint, e)
+            raise
 
     def _post(self, endpoint: str, data: Dict = None) -> Dict:
-        """Send POST request with retry logic for transient failures."""
-        last_exc = None
-        for attempt in range(MAX_RETRIES):
-            data_copy = dict(data or {})
-            data_copy["timestamp"] = self._timestamp()  # fresh timestamp each attempt
-            headers = {
-                "MSG-SIGNATURE": self._sign(data_copy),
-                "Content-Type": "application/x-www-form-urlencoded",
-            }
-            try:
-                resp = self.session.post(
-                    f"{self.base_url}{endpoint}",
-                    data=data_copy,
-                    headers=headers,
-                    timeout=15,
-                )
-                resp.raise_for_status()
-                return resp.json()
-            except requests.RequestException as e:
-                last_exc = e
-                if attempt < MAX_RETRIES - 1:
-                    delay = RETRY_DELAYS[attempt]
-                    logger.warning("POST %s attempt %d/%d failed: %s — retrying in %ds",
-                                   endpoint, attempt + 1, MAX_RETRIES, e, delay)
-                    time.sleep(delay)
-                else:
-                    logger.error("POST %s failed after %d attempts: %s",
-                                 endpoint, MAX_RETRIES, e)
-        raise last_exc
+        """Send signed POST request."""
+        data = data or {}
+        data["timestamp"] = self._timestamp()
+        headers = {
+            "MSG-SIGNATURE": self._sign(data),
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        try:
+            resp = self.session.post(
+                f"{self.base_url}{endpoint}",
+                data=data,
+                headers=headers,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as e:
+            logger.error("POST %s failed: %s", endpoint, e)
+            raise
 
     # ── Public endpoints ──
 
