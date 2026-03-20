@@ -183,7 +183,10 @@ Composite score: 0.4 × Sortino + 0.3 × Sharpe + 0.3 × Calmar
 
 ## Known Limitations / TODO
 
-- Stop-loss cooldown is only in BacktestEngine — needs porting to live TradingBot.run_rebalance_cycle()
+- ~~Stop-loss cooldown is only in BacktestEngine~~ — DONE: ported to live TradingBot + persisted to bot_state.json
 - BULL regime rarely accumulates enough IC observations (regime detector spends most time in NEUTRAL)
-- Roostoo API credentials not yet configured (needs .env with ROOSTOO_API_KEY and ROOSTOO_API_SECRET)
-- Live bot (`python main.py`) not yet tested with real Roostoo API
+- ~~Roostoo API credentials not yet configured~~ — DONE: .env configured, early validation added
+- ~~Live bot not tested~~ — DONE: API connectivity verified (exchange running, 50 pairs available)
+- Retry logic added to roostoo_client.py (3 retries with 2/5/10s backoff)
+- Partial fills now tracked and logged in executor.py
+- State saved immediately after trade execution (before CSV logging)

@@ -1,0 +1,72 @@
+{
+  "coins": [
+    "AAVE",
+    "ADA",
+    "APT",
+    "ARB",
+    "AVAX",
+    "BNB",
+    "BONK",
+    "BTC",
+    "CAKE",
+    "CFX",
+    "CRV",
+    "DOGE",
+    "DOT",
+    "ENA",
+    "ETH",
+    "FET",
+    "FIL",
+    "FLOKI",
+    "HBAR",
+    "ICP",
+    "LINK",
+    "LTC",
+    "NEAR",
+    "PAXG",
+    "PENDLE",
+    "PEPE",
+    "SEI",
+    "SHIB",
+    "SOL",
+    "SUI",
+    "TAO",
+    "TRX",
+    "UNI",
+    "WIF",
+    "WLD",
+    "XLM",
+    "XRP",
+    "ZEC",
+    "ZEN"
+  ],
+  "quality_window": {
+    "start": "2024-10-01",
+    "end": "2025-03-15"
+  },
+  "rebalance_hours": 2,
+  "quality_leaderboard": [
+    {
+      "detector": "legacy_trend",
+      "quality_score": 0.013163,
+      "transitions": 46,
+      "counts": "{\"2\": 275, \"1\": 200, \"0\": 152}",
+      "regime_stats": "{\"0\": {\"count\": 152, \"fwd_24h_mean\": 0.011038, \"fwd_72h_mean\": 0.055435, \"fwd_24h_pos_rate\": 0.5, \"fwd_72h_pos_rate\": 0.5987, \"future_vol_24h\": 0.013746}, \"1\": {\"count\": 195, \"fwd_24h_mean\": 0.01459, \"fwd_72h_mean\": 0.034136, \"fwd_24h_pos_rate\": 0.5692, \"fwd_72h_pos_rate\": 0.5385, \"future_vol_24h\": 0.012661}, \"2\": {\"count\": 208, \"fwd_24h_mean\": 0.021058, \"fwd_72h_mean\": 0.040023, \"fwd_24h_pos_rate\": 0.6058, \"fwd_72h_pos_rate\": 0.524, \"future_vol_24h\": 0.011497}}"
+    },
+    {
+      "detector": "score_market",
+      "quality_score": -0.008118,
+      "transitions": 43,
+      "counts": "{\"1\": 278, \"2\": 230, \"0\": 119}",
+      "regime_stats": "{\"0\": {\"count\": 112, \"fwd_24h_mean\": 0.016857, \"fwd_72h_mean\": 0.072663, \"fwd_24h_pos_rate\": 0.4821, \"fwd_72h_pos_rate\": 0.6964, \"future_vol_24h\": 0.015931}, \"1\": {\"count\": 257, \"fwd_24h_mean\": 0.001903, \"fwd_72h_mean\": 0.00406, \"fwd_24h_pos_rate\": 0.5097, \"fwd_72h_pos_rate\": 0.4475, \"future_vol_24h\": 0.011681}, \"2\": {\"count\": 186, \"fwd_24h_mean\": 0.035086, \"fwd_72h_mean\": 0.076481, \"fwd_24h_pos_rate\": 0.6882, \"fwd_72h_pos_rate\": 0.6022, \"future_vol_24h\": 0.011631}}"
+    },
+    {
+      "detector": "hmm_market",
+      "quality_score": -0.215496,
+      "transitions": 18,
+      "counts": "{\"1\": 366, \"2\": 187, \"0\": 74}",
+      "regime_stats": "{\"0\": {\"count\": 58, \"fwd_24h_mean\": -0.038462, \"fwd_72h_mean\": -0.100627, \"fwd_24h_pos_rate\": 0.3103, \"fwd_72h_pos_rate\": 0.0, \"future_vol_24h\": 0.011537}, \"1\": {\"count\": 323, \"fwd_24h_mean\": 0.007195, \"fwd_72h_mean\": 0.027737, \"fwd_24h_pos_rate\": 0.5108, \"fwd_72h_pos_rate\": 0.517, \"future_vol_24h\": 0.012309}, \"2\": {\"count\": 174, \"fwd_24h_mean\": 0.050631, \"fwd_72h_mean\": 0.116578, \"fwd_24h_pos_rate\": 0.7471, \"fwd_72h_pos_rate\": 0.7931, \"future_vol_24h\": 0.013246}}"
+    }
+  ],
+  "backtests": []
+}

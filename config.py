@@ -124,10 +124,10 @@ class PortfolioConstraints:
     max_single_position_pct: float = 0.20       # max 20% in one coin
     min_single_position_pct: float = 0.03
     max_sector_pct: float = 0.45                # relaxed for crypto sectors
-    min_invested_pct: float = 0.20              # can hold 80% cash in bear
+    min_invested_pct: float = 0.05              # can hold 95% cash in bear (was 20%, too high)
     max_invested_pct: float = 0.90              # max 90% invested, keep 10% buffer
-    min_holdings: int = 4                       # at least 4 positions
-    max_holdings: int = 10                      # max 10 positions (45-coin universe)
+    min_holdings: int = 4                       # at least 4 positions for diversification
+    max_holdings: int = 15                      # max 15 positions (45-coin universe)
 
 
 @dataclass
@@ -138,8 +138,8 @@ class RiskParams:
     lookback_risk_days: int = 90                # 90 days for risk estimation (crypto moves fast)
     vol_scaling: bool = True
     drawdown_deleveraging: bool = True
-    dd_deleverage_start: float = 0.12           # start deleveraging at 12% DD
-    dd_deleverage_full: float = 0.22            # full deleverage at 22% DD
+    dd_deleverage_start: float = 0.08           # start deleveraging at 8% DD (was 12%)
+    dd_deleverage_full: float = 0.18            # full deleverage at 18% DD (was 22%)
     position_stop_loss_pct: float = 0.12        # 12% per-position trailing stop
     correlation_spike_threshold: float = 0.85   # crypto correlations spike in crashes
 
@@ -147,11 +147,12 @@ class RiskParams:
 @dataclass
 class SignalParams:
     factor_weights: Dict[str, float] = field(default_factory=lambda: {
-        "momentum":          0.35,      # trend-following (strongest in crypto)
+        "momentum":          0.25,      # trend-following (strongest in crypto)
         "breakout":          0.20,      # price breakout from range
         "volume_momentum":   0.15,      # volume-confirmed momentum
-        "mean_reversion":    0.15,      # short-term with RSI gate
+        "mean_reversion":    0.10,      # short-term with RSI gate
         "relative_strength": 0.15,      # vs BTC benchmark
+        "residual_momentum": 0.15,      # idiosyncratic trend after market/beta effects
     })
 
     # Momentum params
@@ -166,8 +167,21 @@ class SignalParams:
     # Mean reversion params
     mean_reversion_lookback: int = 48   # 48 hours (2 days)
 
+    # Residual momentum params
+    residual_momentum_lookback: int = 168   # 7 days
+
+    # Universe quality filters
+    min_history_hours: int = 336            # 14 days of data before an asset is tradable
+    liquidity_lookback_hours: int = 24      # 24h dollar volume for liquidity filtering
+    liquidity_filter_quantile: float = 0.40 # keep top 60% by recent dollar volume
+
     # Regime detection params (trend-based, not HMM)
     regime_lookback_hours: int = 336    # 14 days lookback for SMA computation
+    regime_model: str = "legacy_trend"    # legacy_trend | feature_hmm | feature_gmm | score
+    regime_feature_set: str = "market"  # return_only | trend_vol | market
+    regime_n_components: int = 4        # allow crash/recovery to stay separate
+    regime_train_hours: int = 24 * 90   # 90d rolling fit window
+    regime_retrain_hours: int = 24      # refit once per day
 
     # Trend filter
     trend_filter: bool = True
@@ -177,9 +191,9 @@ class SignalParams:
 @dataclass
 class RebalanceConfig:
     frequency_hours: int = 2            # rebalance every 2 hours (best risk-adj composite)
-    min_trade_value_usd: float = 50.0   # minimum trade size (reduce noise trades)
-    min_weight_change: float = 0.03     # don't trade if weight change < 3%
-    max_turnover_pct: float = 0.40      # max 40% turnover per rebalance
+    min_trade_value_usd: float = 100.0  # minimum trade size (was $50, too much churn)
+    min_weight_change: float = 0.04     # don't trade if weight change < 4% (was 3%)
+    max_turnover_pct: float = 0.35      # max 35% turnover per rebalance (was 40%)
 
 
 @dataclass

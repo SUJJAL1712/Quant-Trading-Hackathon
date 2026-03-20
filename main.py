@@ -29,6 +29,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
 
 import config as cfg
 from roostoo_client import RoostooClient
@@ -94,6 +95,7 @@ def setup_logging():
             logging.FileHandler(log_file),
             logging.StreamHandler(sys.stdout),
         ],
+        force=True,  # allow reconfiguration on reimport / restart
     )
 
 
@@ -165,8 +167,12 @@ class TradingBot:
         self.state = load_state()
 
         # Stop-loss cooldown: {coin: cycles_remaining}
-        self._stop_cooldown: Dict[str, int] = {}
-        self._STOP_COOLDOWN_CYCLES = 6  # 6 rebalance cycles = 24h cooldown
+        # Restore from persisted state (survives restarts)
+        self._stop_cooldown: Dict[str, int] = {
+            k: v for k, v in self.state.get("stop_cooldown", {}).items()
+            if isinstance(v, (int, float)) and v > 0
+        }
+        self._STOP_COOLDOWN_CYCLES = max(6, 24 // max(cfg.REBALANCE.frequency_hours, 1))
 
         # Restore risk manager state
         for nav in self.state.get("nav_history", []):
@@ -293,6 +299,9 @@ class TradingBot:
         # 2. Cancel any pending orders
         self.executor.cancel_all_pending()
 
+        # 2b. Refresh ticker cache for bid/ask spread data
+        self.executor.refresh_ticker_cache()
+
         # 3. Fetch current state
         holdings = self.executor.get_current_holdings()
         prices = self.client.get_all_prices()
@@ -353,9 +362,11 @@ class TradingBot:
             {f"{c}/USD": self.state.get("entry_prices", {}).get(c, 0) for c in check_coins},
             stop_pct_override=stop_pct,
         )
+        stopped_coins = []
         if stopped:
             for pair in stopped:
                 coin = pair.split("/")[0]
+                stopped_coins.append(coin)
                 if coin in alpha_scores.index:
                     alpha_scores[coin] = -10.0  # strong sell signal
                 self._stop_cooldown[coin] = self._STOP_COOLDOWN_CYCLES
@@ -368,8 +379,9 @@ class TradingBot:
 
         # Check correlation spike (crash detection)
         if self.risk_mgr.check_correlation_spike(returns):
-            logger.warning("Correlation spike detected — shifting to defensive")
+            logger.warning("Correlation spike detected -- shifting to defensive")
             regime = 2  # Force bear regime
+            regime_name = "BEAR"  # Keep name in sync with override
 
         # 7. Optimize portfolio
         target_weights, diagnostics = self.optimizer.optimize(
@@ -377,18 +389,23 @@ class TradingBot:
             returns=returns,
             regime=regime,
             current_drawdown=self.risk_mgr.current_drawdown,
+            prices=close_prices,
         )
 
         logger.info("Target weights: %s", target_weights.to_dict())
         logger.info("Diagnostics: %s", diagnostics)
 
-        # 8. Generate orders
+        # 8. Generate orders (with cost-aware filtering and limit order selection)
         target_dict = target_weights.to_dict()
+        # Coins that need urgent MARKET execution (stop-loss triggered, force exit)
+        urgent_coins = set(stopped_coins) if stopped_coins else set()
         orders = self.executor.generate_orders(
             current_holdings=holdings,
             target_weights=target_dict,
             current_prices=prices,
             portfolio_value=nav,
+            alpha_scores=alpha_scores.to_dict() if hasattr(alpha_scores, 'to_dict') else {},
+            urgent_coins=urgent_coins,
         )
 
         if not orders:
@@ -415,6 +432,13 @@ class TradingBot:
 
         # 10. Update state
         filled = [o for o in executed if o.status == "FILLED"]
+        partial = [o for o in executed if o.status not in ("FILLED", "FAILED", "PENDING")
+                   and (o.fill_quantity or 0) > 0]
+        if partial:
+            logger.warning("Partial fills detected: %s",
+                           [(o.pair, o.fill_quantity, o.quantity) for o in partial])
+            filled.extend(partial)  # treat partial fills as filled for state tracking
+
         total_commission = sum(o.commission or 0 for o in filled)
 
         # Update entry prices for new buys
@@ -438,7 +462,10 @@ class TradingBot:
             "total_trades": self.state.get("total_trades", 0) + len(filled),
             "total_commission": self.state.get("total_commission", 0) + total_commission,
             "nav_history": self.risk_mgr.nav_history[-500:],  # keep last 500
+            "stop_cooldown": dict(self._stop_cooldown),  # persist cooldowns across restarts
         })
+        # Save state IMMEDIATELY after trade execution — before CSV logging,
+        # so critical state (entry prices, cooldowns) survives any subsequent crash
         save_state(self.state)
 
         # 11. Log to CSV
@@ -483,11 +510,13 @@ class TradingBot:
             sys.exit(1)
         self._validate_trading_pairs()
 
+        consecutive_failures = 0
         while not _shutdown:
             try:
                 if self.should_rebalance():
                     result = self.run_rebalance_cycle()
                     logger.info("Cycle result: %s", result.get("status"))
+                    consecutive_failures = 0  # reset on success
                 else:
                     # Between cycles: just track NAV
                     try:
@@ -498,8 +527,27 @@ class TradingBot:
                     except Exception as e:
                         logger.debug("NAV check failed: %s", e)
 
+            except requests.RequestException as e:
+                consecutive_failures += 1
+                backoff = min(60 * consecutive_failures, 600)  # up to 10 min
+                logger.error("Network error (attempt %d): %s — backing off %ds",
+                             consecutive_failures, e, backoff)
+                # Extra sleep for network issues
+                for _ in range(backoff):
+                    if _shutdown:
+                        break
+                    time.sleep(1)
             except Exception as e:
-                logger.error("Rebalance cycle failed: %s", e, exc_info=True)
+                consecutive_failures += 1
+                logger.error("Rebalance cycle failed (attempt %d): %s",
+                             consecutive_failures, e, exc_info=True)
+                if consecutive_failures >= 10:
+                    logger.critical("10 consecutive failures — saving state and pausing 30min")
+                    save_state(self.state)
+                    for _ in range(1800):
+                        if _shutdown:
+                            break
+                        time.sleep(1)
 
             # Sleep between checks (check every 5 minutes)
             sleep_seconds = 300
@@ -528,6 +576,16 @@ class BacktestEngine:
     # Commission rate matching Roostoo (maker 0.008% + taker 0.012%)
     COMMISSION_RATE = 0.0001  # 0.01% per side (Roostoo is very low fee)
 
+    # Slippage model: bps of adverse price movement per trade
+    # Accounts for bid-ask spread crossing + market impact
+    # Conservative: 2 bps for large-cap, up to 5 bps for small-cap
+    SLIPPAGE_BPS = 2.0  # basis points (0.02%)
+
+    # Large-cap coins get less slippage, small-cap more
+    LOW_SLIPPAGE_COINS = {"BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA"}
+    HIGH_SLIPPAGE_COINS = {"VIRTUAL", "BIO", "OPEN", "FORM", "OMNI", "S",
+                           "PENGU", "TRUMP", "WIF", "BONK", "FLOKI"}
+
     def __init__(self, start: str, end: str, initial_capital: float = None,
                  rebalance_hours: int = None, adaptive: bool = True):
         self.start = pd.Timestamp(start, tz="UTC")
@@ -548,7 +606,7 @@ class BacktestEngine:
 
         # Stop-loss cooldown: {coin: cycles_remaining}
         self._stop_cooldown: Dict[str, int] = {}
-        self._STOP_COOLDOWN_CYCLES = 6  # 6 rebalance cycles = 24h cooldown
+        self._STOP_COOLDOWN_CYCLES = max(6, 24 // max(self.rebalance_hours, 1))
 
         # Results tracking
         self.nav_series: List[Tuple[pd.Timestamp, float]] = []
@@ -573,39 +631,136 @@ class BacktestEngine:
         for coin in coins:
             binance_symbol = cfg.ROOSTOO_TO_BINANCE.get(f"{coin}/USD", f"{coin}USDT")
 
-            # Paginate through the range
-            all_data = []
-            current_start = start_ms
-            while current_start < end_ms:
-                df = binance.fetch_klines(
-                    binance_symbol, interval,
-                    start_time=current_start, end_time=end_ms, limit=1000,
-                )
-                if df.empty:
-                    break
-                all_data.append(df)
-                last_ts = int(df.index[-1].timestamp() * 1000)
-                if last_ts <= current_start:
-                    break
-                current_start = last_ts + 1
-                time.sleep(0.05)
-
-            if all_data:
-                combined = pd.concat(all_data)
-                combined = combined[~combined.index.duplicated(keep="last")]
-                close_frames[coin] = combined["close"]
-                if "volume" in combined.columns:
-                    self._volume_cache[coin] = combined["volume"]
-                # Cache for future runs
-                self.data_engine.cache.save_ohlcv(binance_symbol, interval, combined)
+            cached = self.data_engine.cache.get_cached(
+                binance_symbol, interval, since=start.to_pydatetime()
+            )
+            if not cached.empty:
+                combined = cached.loc[(cached.index >= start) & (cached.index <= end)].copy()
             else:
-                logger.warning("No Binance data for %s in range", coin)
+                combined = pd.DataFrame()
+
+            if combined.empty:
+                combined = self._load_monthly_csv_range(coin, start, end, interval)
+
+            if combined.empty:
+                # Fall back to Binance only if the cache does not have the symbol.
+                all_data = []
+                current_start = start_ms
+                while current_start < end_ms:
+                    df = binance.fetch_klines(
+                        binance_symbol, interval,
+                        start_time=current_start, end_time=end_ms, limit=1000,
+                    )
+                    if df.empty:
+                        break
+                    all_data.append(df)
+                    last_ts = int(df.index[-1].timestamp() * 1000)
+                    if last_ts <= current_start:
+                        break
+                    current_start = last_ts + 1
+                    time.sleep(0.05)
+
+                if all_data:
+                    combined = pd.concat(all_data)
+                    combined = combined[~combined.index.duplicated(keep="last")]
+                    self.data_engine.cache.save_ohlcv(binance_symbol, interval, combined)
+                else:
+                    logger.warning("No historical data for %s in range", coin)
+                    continue
+
+            combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+            if combined.empty:
+                continue
+
+            close_frames[coin] = combined["close"]
+            if "volume" in combined.columns:
+                self._volume_cache[coin] = combined["volume"]
 
         if not close_frames:
             return pd.DataFrame()
 
-        prices = pd.DataFrame(close_frames).sort_index().ffill()
+        # Keep genuine NaNs: they tell us when an asset was not yet listed or
+        # no longer has valid market data. Forward-filling here creates false
+        # tradability and was a major source of stale-position distortions.
+        prices = pd.DataFrame(close_frames).sort_index()
         return prices
+
+    def _load_monthly_csv_range(self, coin: str, start: pd.Timestamp,
+                                end: pd.Timestamp, interval: str = "1h") -> pd.DataFrame:
+        """Load hourly data from the exported monthly CSV archive."""
+        base_dir = os.path.join("data", "monthly_ohlcv")
+        if not os.path.isdir(base_dir):
+            return pd.DataFrame()
+
+        frames = []
+        for month in pd.period_range(start=start, end=end, freq="M"):
+            month_dir = os.path.join(base_dir, str(month))
+            file_name = f"{coin}_USD_{interval}.csv"
+            path = os.path.join(month_dir, file_name)
+            if not os.path.exists(path):
+                continue
+
+            try:
+                df = pd.read_csv(path, parse_dates=["timestamp"])
+            except Exception as e:
+                logger.warning("Failed to read monthly archive %s: %s", path, e)
+                continue
+
+            if df.empty or "timestamp" not in df.columns:
+                continue
+
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+            df = df.set_index("timestamp")
+            keep_cols = [c for c in ["open", "high", "low", "close", "volume", "quote_volume"] if c in df.columns]
+            df = df[keep_cols]
+            frames.append(df)
+
+        if not frames:
+            return pd.DataFrame()
+
+        combined = pd.concat(frames)
+        combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+        return combined.loc[(combined.index >= start) & (combined.index <= end)]
+
+    def _force_exit_missing_price_positions(self, timestamp: pd.Timestamp,
+                                            close_prices: pd.DataFrame) -> int:
+        """Liquidate held coins once their market data disappears."""
+        forced = 0
+        for coin in list(self.holdings):
+            if coin not in close_prices.columns:
+                continue
+
+            current = close_prices.at[timestamp, coin] if timestamp in close_prices.index else np.nan
+            if pd.notna(current):
+                continue
+
+            history = close_prices[coin].loc[:timestamp].dropna()
+            if history.empty:
+                continue
+
+            exit_price = float(history.iloc[-1])
+            qty = self.holdings.pop(coin, 0.0)
+            if qty <= 0:
+                continue
+
+            proceeds = qty * exit_price
+            commission = proceeds * self.COMMISSION_RATE
+            self.cash += proceeds - commission
+            self.entry_prices.pop(coin, None)
+            self.risk_mgr.reset_position_hwm(coin)
+            forced += 1
+            self.trade_log.append({
+                "timestamp": str(timestamp),
+                "pair": f"{coin}/USD",
+                "side": "SELL",
+                "quantity": qty,
+                "price": exit_price,
+                "value": proceeds,
+                "commission": commission,
+                "reason": "data_unavailable_exit",
+            })
+
+        return forced
 
     def _compute_nav(self, prices: pd.Series) -> float:
         """Compute portfolio NAV from current holdings + cash."""
@@ -615,15 +770,49 @@ class BacktestEngine:
                 holdings_value += qty * prices[coin]
         return self.cash + holdings_value
 
+    def _get_slippage_bps(self, coin: str) -> float:
+        """Get slippage in basis points based on coin liquidity tier."""
+        if coin in self.LOW_SLIPPAGE_COINS:
+            return self.SLIPPAGE_BPS * 0.5   # 1 bps for large-cap
+        elif coin in self.HIGH_SLIPPAGE_COINS:
+            return self.SLIPPAGE_BPS * 2.5   # 5 bps for small-cap
+        return self.SLIPPAGE_BPS              # 2 bps default
+
+    def _apply_slippage(self, price: float, side: str, coin: str) -> float:
+        """Apply slippage to a trade price.
+
+        Buys execute at a slightly higher price (adverse),
+        sells execute at a slightly lower price (adverse).
+        """
+        slip_bps = self._get_slippage_bps(coin)
+        slip_frac = slip_bps / 10000.0
+        if side == "BUY":
+            return price * (1 + slip_frac)
+        else:
+            return price * (1 - slip_frac)
+
     def _execute_rebalance(self, target_weights: pd.Series, prices: pd.Series,
-                           nav: float, timestamp: pd.Timestamp) -> int:
-        """Simulate rebalance execution at close prices.
+                           nav: float, timestamp: pd.Timestamp,
+                           alpha_scores: pd.Series = None,
+                           regime: int = 1) -> int:
+        """Simulate rebalance execution with slippage and cost-aware filtering.
 
         Returns number of trades executed.
         """
         trades = 0
         sells_first = []
         buys_second = []
+        alpha_scores = alpha_scores if alpha_scores is not None else pd.Series(dtype=float)
+
+        # Dynamic thresholds: raise bars in non-bull regimes to reduce churn
+        min_trade_val = cfg.REBALANCE.min_trade_value_usd
+        min_wt_change = cfg.REBALANCE.min_weight_change
+        if regime == 2:
+            min_trade_val *= 1.5   # $150 min in bear (was $100)
+            min_wt_change *= 1.5   # 6% min change in bear (was 4%)
+        elif regime == 1:
+            min_trade_val *= 1.25  # $125 min in neutral
+            min_wt_change *= 1.25  # 5% min change in neutral
 
         for coin in set(list(self.holdings.keys()) + list(target_weights.index)):
             price = prices.get(coin, 0)
@@ -640,25 +829,37 @@ class BacktestEngine:
 
             diff_qty = target_qty - current_qty
             diff_value = abs(diff_qty * price)
+            force_exit = (target_weight <= 1e-8 and current_qty > 0
+                          and current_value >= cfg.REBALANCE.min_trade_value_usd)
 
-            # Skip tiny trades
-            if diff_value < cfg.REBALANCE.min_trade_value_usd:
+            # Skip tiny trades (use dynamic threshold)
+            if diff_value < min_trade_val:
                 continue
             weight_change = abs(target_weight - current_weight)
-            if weight_change < cfg.REBALANCE.min_weight_change:
+            if not force_exit and weight_change < min_wt_change:
                 continue
+
+            # Cost-aware filter: skip if expected alpha doesn't justify costs
+            if not force_exit and coin in alpha_scores.index:
+                alpha_z = abs(alpha_scores[coin])
+                expected_alpha_bps = alpha_z * 50.0  # z=1 ~ 50 bps
+                slip_bps = self._get_slippage_bps(coin)
+                round_trip_cost_bps = (self.COMMISSION_RATE * 2 * 10000) + (slip_bps * 2)
+                if expected_alpha_bps < round_trip_cost_bps * 1.5:
+                    continue  # not worth the cost
 
             if diff_qty < 0:
                 sells_first.append((coin, diff_qty, price))
             else:
                 buys_second.append((coin, diff_qty, price))
 
-        # Execute sells first (free up cash)
+        # Execute sells first (free up cash) — with slippage
         for coin, diff_qty, price in sells_first:
             sell_qty = min(abs(diff_qty), self.holdings.get(coin, 0))
             if sell_qty <= 0:
                 continue
-            proceeds = sell_qty * price
+            exec_price = self._apply_slippage(price, "SELL", coin)
+            proceeds = sell_qty * exec_price
             commission = proceeds * self.COMMISSION_RATE
             self.cash += proceeds - commission
             self.holdings[coin] = self.holdings.get(coin, 0) - sell_qty
@@ -669,13 +870,15 @@ class BacktestEngine:
             self.trade_log.append({
                 "timestamp": str(timestamp),
                 "pair": f"{coin}/USD", "side": "SELL",
-                "quantity": sell_qty, "price": price,
+                "quantity": sell_qty, "price": exec_price,
                 "value": proceeds, "commission": commission,
+                "slippage_bps": self._get_slippage_bps(coin),
             })
 
-        # Execute buys
+        # Execute buys — with slippage
         for coin, diff_qty, price in buys_second:
-            buy_value = diff_qty * price
+            exec_price = self._apply_slippage(price, "BUY", coin)
+            buy_value = diff_qty * exec_price
             commission = buy_value * self.COMMISSION_RATE
             total_cost = buy_value + commission
 
@@ -684,7 +887,7 @@ class BacktestEngine:
                 if self.cash < cfg.REBALANCE.min_trade_value_usd:
                     continue
                 buy_value = self.cash / (1 + self.COMMISSION_RATE)
-                diff_qty = buy_value / price
+                diff_qty = buy_value / exec_price
                 commission = buy_value * self.COMMISSION_RATE
                 total_cost = buy_value + commission
 
@@ -692,13 +895,14 @@ class BacktestEngine:
             prev_qty = self.holdings.get(coin, 0)
             self.holdings[coin] = prev_qty + diff_qty
             if coin not in self.entry_prices:
-                self.entry_prices[coin] = price
+                self.entry_prices[coin] = exec_price
             trades += 1
             self.trade_log.append({
                 "timestamp": str(timestamp),
                 "pair": f"{coin}/USD", "side": "BUY",
-                "quantity": diff_qty, "price": price,
+                "quantity": diff_qty, "price": exec_price,
                 "value": buy_value, "commission": commission,
+                "slippage_bps": self._get_slippage_bps(coin),
             })
 
         return trades
@@ -774,6 +978,8 @@ class BacktestEngine:
         last_rebalance_ts = None
 
         for i, ts in enumerate(bt_timestamps):
+            self._force_exit_missing_price_positions(ts, close_prices)
+
             # Compute NAV at every timestamp
             current_prices = close_prices.loc[ts].dropna()
             nav = self._compute_nav(current_prices)
@@ -792,16 +998,40 @@ class BacktestEngine:
             if not should_rebalance:
                 continue
 
-            # Get lookback window for signals
-            lookback_data = close_prices.loc[:ts]
-            lookback_returns = returns.loc[:ts]
-
-            if len(lookback_data) < cfg.SIGNALS.regime_lookback_hours // 2:
+            full_lookback = close_prices.loc[:ts]
+            if len(full_lookback) < cfg.SIGNALS.regime_lookback_hours // 2:
                 continue  # not enough warmup data yet
+
+            history_counts = full_lookback.notna().sum()
+            current_row = close_prices.loc[ts]
+            tradable_coins = [
+                coin for coin in available_coins
+                if pd.notna(current_row.get(coin))
+                and history_counts.get(coin, 0) >= cfg.SIGNALS.min_history_hours
+            ]
+
+            if cfg.BENCHMARK in available_coins and pd.notna(current_row.get(cfg.BENCHMARK)):
+                if cfg.BENCHMARK not in tradable_coins:
+                    tradable_coins.append(cfg.BENCHMARK)
+
+            if not tradable_coins:
+                continue
+
+            # Only forward-fill very small internal gaps. Do not allow missing
+            # assets to become permanently tradable.
+            lookback_data = full_lookback[tradable_coins].ffill(limit=2)
+            active_cols = lookback_data.columns[lookback_data.notna().sum() >= cfg.SIGNALS.min_history_hours]
+            lookback_data = lookback_data[active_cols]
+            if lookback_data.empty:
+                continue
+
+            lookback_returns = np.log(lookback_data / lookback_data.shift(1)).iloc[1:]
+            if lookback_returns.empty:
+                continue
 
             # Build volume data for this lookback window
             vol_frames = {}
-            for coin in available_coins:
+            for coin in lookback_data.columns:
                 if coin in self._volume_cache:
                     v = self._volume_cache[coin]
                     v_window = v.loc[:ts]
@@ -815,7 +1045,8 @@ class BacktestEngine:
 
             # Check risk
             regime = self.alpha_engine.current_regime
-            if self.risk_mgr.check_correlation_spike(lookback_returns):
+            corr_returns = lookback_returns.loc[:, lookback_returns.notna().sum() >= 24]
+            if not corr_returns.empty and self.risk_mgr.check_correlation_spike(corr_returns):
                 regime = 2  # force bear
 
             # Decrement cooldowns
@@ -851,10 +1082,18 @@ class BacktestEngine:
                 returns=lookback_returns,
                 regime=regime,
                 current_drawdown=self.risk_mgr.current_drawdown,
+                prices=lookback_data,
             )
 
             if target_weights.empty:
-                continue
+                # Empty weights = go to cash. If we have holdings, sell them all.
+                if self.holdings:
+                    logger.info("Empty target weights -- liquidating all %d positions to cash",
+                                len(self.holdings))
+                    # Create zero-weight target for all held coins to trigger sells
+                    target_weights = pd.Series(0.0, index=list(self.holdings.keys()))
+                else:
+                    continue  # already in cash, nothing to do
 
             # Enforce turnover cap (matching live mode)
             proposed_turnover = 0.0
@@ -876,8 +1115,9 @@ class BacktestEngine:
                     target_weights[coin] = current_weight + scale * (target_weights[coin] - current_weight)
                 target_weights = target_weights.clip(lower=0)
 
-            # Execute rebalance
-            n_trades = self._execute_rebalance(target_weights, current_prices, nav, ts)
+            # Execute rebalance (with slippage + cost-aware filtering)
+            n_trades = self._execute_rebalance(target_weights, current_prices, nav, ts,
+                                               alpha_scores=alpha_scores, regime=regime)
             total_trades += n_trades
             rebalance_count += 1
             last_rebalance_ts = ts
@@ -955,7 +1195,20 @@ class BacktestEngine:
 
         # NAV series
         nav_df = pd.DataFrame(self.nav_series, columns=["timestamp", "nav_usd"])
+        nav_df["timestamp"] = pd.to_datetime(nav_df["timestamp"], utc=True)
         nav_df.to_csv(os.path.join(out_dir, "nav_series.csv"), index=False)
+
+        # Monthly returns
+        monthly_df = pd.DataFrame()
+        if not nav_df.empty:
+            nav_ts = nav_df.set_index("timestamp")["nav_usd"]
+            nav_ts_no_tz = nav_ts.copy()
+            nav_ts_no_tz.index = nav_ts_no_tz.index.tz_localize(None)
+            monthly_df = nav_ts_no_tz.groupby(nav_ts_no_tz.index.to_period("M")).agg(["first", "last"])
+            monthly_df["return_pct"] = (monthly_df["last"] / monthly_df["first"] - 1) * 100
+            monthly_df.index = monthly_df.index.astype(str)
+            monthly_df.index.name = "month"
+            monthly_df.to_csv(os.path.join(out_dir, "monthly_returns.csv"))
 
         # Trade log
         if self.trade_log:
@@ -968,6 +1221,16 @@ class BacktestEngine:
                 os.path.join(out_dir, "portfolio_log.csv"), index=False)
 
         # Summary
+        if not monthly_df.empty:
+            positive_months = int((monthly_df["return_pct"] > 0).sum())
+            negative_months = int((monthly_df["return_pct"] <= 0).sum())
+            monthly_hit_rate = positive_months / len(monthly_df)
+            summary["monthly_hit_rate"] = round(monthly_hit_rate, 4)
+            summary["positive_months"] = positive_months
+            summary["negative_months"] = negative_months
+            summary["best_month_pct"] = round(float(monthly_df["return_pct"].max()), 2)
+            summary["worst_month_pct"] = round(float(monthly_df["return_pct"].min()), 2)
+
         with open(os.path.join(out_dir, "summary.json"), "w") as f:
             json.dump(summary, f, indent=2)
 
@@ -1033,6 +1296,13 @@ def main():
         result = engine.run()
         print(json.dumps(result, indent=2, default=str))
         sys.exit(0 if result.get("status") == "OK" else 1)
+
+    # Early credential validation for live trading modes
+    if not args.backtest:
+        if not cfg.ROOSTOO_API_KEY or not cfg.ROOSTOO_API_SECRET:
+            logger.error("FATAL: Roostoo API credentials not set! "
+                         "Create a .env file with ROOSTOO_API_KEY and ROOSTOO_API_SECRET")
+            sys.exit(1)
 
     bot = TradingBot()
 

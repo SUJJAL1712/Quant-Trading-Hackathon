@@ -15,6 +15,7 @@ from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
 
 import config as cfg
+from protective_allocation import ProtectiveAllocationEngine, ProtectiveAllocConfig
 
 logger = logging.getLogger(__name__)
 
@@ -182,22 +183,24 @@ class PortfolioOptimizer:
 
     # Regime-dependent blending ratios and invested targets
     REGIME_BLEND = {
-        0: {"bl_ratio": 0.80, "view_conf": 0.08, "vol_scale_range": (0.8, 1.5),
-            "target_invested": 0.85},   # Bull: trust signals, invest aggressively
-        1: {"bl_ratio": 0.50, "view_conf": 0.05, "vol_scale_range": (0.5, 1.2),
-            "target_invested": 0.60},   # Neutral: balanced
-        2: {"bl_ratio": 0.25, "view_conf": 0.02, "vol_scale_range": (0.3, 0.8),
-            "target_invested": 0.35},   # Bear: defensive, hold cash
+        0: {"bl_ratio": 0.80, "view_conf": 0.08, "vol_scale_range": (0.8, 1.8),
+            "target_invested": 0.85},   # Bull: maximize gains in uptrend
+        1: {"bl_ratio": 0.50, "view_conf": 0.05, "vol_scale_range": (0.5, 1.3),
+            "target_invested": 0.65},   # Neutral: moderate
+        2: {"bl_ratio": 0.10, "view_conf": 0.02, "vol_scale_range": (0.3, 0.8),
+            "target_invested": 0.50},   # Bear: mostly HRP for better diversification
     }
 
     # Allocation smoothing: blend toward target weights instead of jumping
-    SMOOTHING_ALPHA = 0.5  # 50% toward new target each cycle
+    SMOOTHING_ALPHA = 0.55  # slightly faster than 0.5
 
     def __init__(self):
         self._prev_weights = pd.Series(dtype=float)
+        self.protection_engine = ProtectiveAllocationEngine()
 
     def optimize(self, alpha_scores: pd.Series, returns: pd.DataFrame,
-                 regime: int = 1, current_drawdown: float = 0.0) -> Tuple[pd.Series, Dict]:
+                 regime: int = 1, current_drawdown: float = 0.0,
+                 prices: pd.DataFrame = None) -> Tuple[pd.Series, Dict]:
         """Run full optimization pipeline.
 
         Args:
@@ -218,7 +221,18 @@ class PortfolioOptimizer:
         if not common:
             return pd.Series(1.0 / len(coins), index=coins), {"error": "no matching returns"}
 
-        ret = returns[common].dropna()
+        # Don't dropna(how='any') — that kills all rows whenever a single
+        # coin has a gap.  Instead, keep rows where at least half the coins
+        # have data, and let covariance / BL handle per-pair completeness.
+        ret = returns[common].dropna(how="all")
+        # Further filter: only keep coins with enough non-NaN rows to
+        # estimate covariance (at least 48 observations)
+        min_obs = min(48, max(len(ret) // 4, 10))
+        good_coins = [c for c in common if ret[c].notna().sum() >= min_obs]
+        if not good_coins:
+            good_coins = common  # fallback: use whatever we have
+        ret = ret[good_coins].dropna()
+        common = good_coins
         alpha = alpha_scores.reindex(common, fill_value=0)
 
         # Get regime parameters
@@ -228,13 +242,33 @@ class PortfolioOptimizer:
         vol_lo, vol_hi = params["vol_scale_range"]
         target_invested = params["target_invested"]
 
-        # Concentrate: only keep top-N coins by alpha score
+        # Protective allocation: compute stress-based cash shield
+        protection_result = {}
+        if prices is not None and not prices.empty:
+            protection_result = self.protection_engine.compute_protection(
+                prices=prices,
+                returns=ret,
+                current_drawdown=current_drawdown,
+                regime=regime,
+            )
+            # Scale target_invested by the protection multiplier
+            invested_mult = protection_result.get("invested_multiplier", 1.0)
+            target_invested *= invested_mult
+
+            # Floor: don't go below minimum
+            min_invested = self.protection_engine.config.min_invested_override
+            target_invested = max(target_invested, min_invested)
+
+        # Concentrate: keep top-N coins by alpha score.
+        # Don't filter to only positive alpha — the optimizer weights and
+        # target_invested scaling handle exposure. Filtering to positive-only
+        # causes extreme concentration (3-5 names) when most alphas are negative.
         max_hold = cfg.CONSTRAINTS.max_holdings
-        top_coins = alpha.nlargest(max_hold)
-        # Only include coins with positive alpha
-        top_coins = top_coins[top_coins > 0]
-        if len(top_coins) < cfg.CONSTRAINTS.min_holdings:
-            top_coins = alpha.nlargest(cfg.CONSTRAINTS.min_holdings)
+        min_hold = cfg.CONSTRAINTS.min_holdings
+        top_coins = alpha.nlargest(max(max_hold, min_hold))
+        # Ensure minimum diversification
+        if len(top_coins) < min_hold:
+            top_coins = alpha.nlargest(min_hold)
 
         concentrated = [c for c in common if c in top_coins.index]
         if not concentrated:
@@ -264,12 +298,14 @@ class PortfolioOptimizer:
         if total > 0:
             combined = combined * (target_invested / total)
 
-        # Drawdown deleveraging
-        if cfg.RISK.drawdown_deleveraging and current_drawdown > cfg.RISK.dd_deleverage_start:
+        # Drawdown deleveraging — skip if protection is already handling DD
+        # (they both respond to drawdown, stacking them crushes exposure)
+        protection_active = protection_result.get("protection_score", 0.0) > 0.1
+        if cfg.RISK.drawdown_deleveraging and current_drawdown > cfg.RISK.dd_deleverage_start and not protection_active:
             dd_range = cfg.RISK.dd_deleverage_full - cfg.RISK.dd_deleverage_start
             if dd_range > 0:
                 deleverage = 1 - 0.7 * min((current_drawdown - cfg.RISK.dd_deleverage_start) / dd_range, 1.0)
-                deleverage = max(deleverage, 0.2)  # can go as low as 20% invested
+                deleverage = max(deleverage, 0.3)
                 combined *= deleverage
                 logger.info("Drawdown deleveraging: %.1f%% DD -> scale=%.2f",
                             current_drawdown * 100, deleverage)
@@ -292,8 +328,8 @@ class PortfolioOptimizer:
             prev = self._prev_weights.reindex(all_coins, fill_value=0)
             curr = combined.reindex(all_coins, fill_value=0)
             smoothed = (1 - self.SMOOTHING_ALPHA) * prev + self.SMOOTHING_ALPHA * curr
-            # Drop coins that are being exited (new target = 0 and prev < min threshold)
-            smoothed = smoothed[smoothed > 0.005]
+            # Drop only truly negligible positions
+            smoothed = smoothed[smoothed > 0.002]
             # Re-enforce constraints after smoothing (smoothing can reintroduce
             # old names and violate position/invested limits)
             combined = self._enforce_constraints(smoothed)
@@ -306,6 +342,8 @@ class PortfolioOptimizer:
             "n_positions": (combined > 0.01).sum(),
             "invested_pct": combined.sum(),
             "max_position": combined.max(),
+            "protection_score": protection_result.get("protection_score", 0.0),
+            "cash_fraction": protection_result.get("cash_fraction", 0.0),
         }
 
         return combined, diagnostics
@@ -340,7 +378,7 @@ class PortfolioOptimizer:
         cons = cfg.CONSTRAINTS
 
         # Remove near-zero weights
-        weights = weights[weights > 0.005].copy()
+        weights = weights[weights > 0.002].copy()
 
         if weights.empty:
             return weights
@@ -368,8 +406,9 @@ class PortfolioOptimizer:
             # Respect invested bounds
             if total > cons.max_invested_pct:
                 weights = weights * (cons.max_invested_pct / total)
-            elif total < cons.min_invested_pct:
-                weights = weights * (cons.min_invested_pct / total)
+            # Don't force minimum investment — if the optimizer wants
+            # less than min_invested, let it (the target_invested scaling
+            # already set the desired level based on regime)
 
             # Cap individual positions
             capped = weights > cons.max_single_position_pct

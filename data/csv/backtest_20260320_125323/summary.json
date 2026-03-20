@@ -1,0 +1,110 @@
+{
+  "status": "OK",
+  "run_id": "20260320_125323",
+  "start": "2024-10-01",
+  "end": "2025-03-15",
+  "rebalance_hours": 2,
+  "adaptive": true,
+  "initial_capital": 100000.0,
+  "final_nav": 171177.05,
+  "total_return_pct": 71.18,
+  "sortino": 0.0361,
+  "sharpe": 0.0299,
+  "calmar": 0.0008,
+  "composite_score": 0.0236,
+  "max_drawdown_pct": 19.12,
+  "rebalance_count": 1769,
+  "total_trades": 2338,
+  "total_commission": 2105.09,
+  "n_coins": 46,
+  "adaptive_diagnostics": {
+    "ic_ir": {
+      "0": {
+        "momentum": -0.0576,
+        "breakout": -0.1708,
+        "volume_momentum": -0.2317,
+        "mean_reversion": 0.2431,
+        "relative_strength": -0.2472,
+        "residual_momentum": -0.0979
+      },
+      "1": {
+        "momentum": -0.0408,
+        "breakout": -0.0138,
+        "volume_momentum": -0.0737,
+        "mean_reversion": -0.03,
+        "relative_strength": -0.0571,
+        "residual_momentum": -0.0144
+      },
+      "2": {
+        "momentum": -0.3085,
+        "breakout": 0.404,
+        "volume_momentum": 0.1854,
+        "mean_reversion": -1.0017,
+        "relative_strength": 0.2511,
+        "residual_momentum": 0.1723
+      }
+    },
+    "mean_ic": {
+      "0": {
+        "momentum": -0.0117,
+        "breakout": -0.0268,
+        "volume_momentum": -0.0493,
+        "mean_reversion": 0.0445,
+        "relative_strength": -0.0443,
+        "residual_momentum": -0.0136
+      },
+      "1": {
+        "momentum": -0.0095,
+        "breakout": -0.0031,
+        "volume_momentum": -0.0153,
+        "mean_reversion": -0.0058,
+        "relative_strength": -0.0122,
+        "residual_momentum": -0.002
+      },
+      "2": {
+        "momentum": -0.065,
+        "breakout": 0.081,
+        "volume_momentum": 0.0387,
+        "mean_reversion": -0.3339,
+        "relative_strength": 0.0491,
+        "residual_momentum": 0.0279
+      }
+    },
+    "obs_count": {
+      "0": 535,
+      "1": 471,
+      "2": 1185
+    },
+    "current_weights": {
+      "0": {
+        "momentum": 0.2681,
+        "breakout": 0.1838,
+        "volume_momentum": 0.1278,
+        "mean_reversion": 0.1094,
+        "relative_strength": 0.1271,
+        "residual_momentum": 0.1839
+      },
+      "1": {
+        "momentum": 0.2122,
+        "breakout": 0.1573,
+        "volume_momentum": 0.1291,
+        "mean_reversion": 0.158,
+        "relative_strength": 0.1569,
+        "residual_momentum": 0.1865
+      },
+      "2": {
+        "momentum": 0.1249,
+        "breakout": 0.1128,
+        "volume_momentum": 0.1342,
+        "mean_reversion": 0.1939,
+        "relative_strength": 0.1913,
+        "residual_momentum": 0.2429
+      }
+    }
+  },
+  "monthly_hit_rate": 0.5,
+  "positive_months": 3,
+  "negative_months": 3,
+  "best_month_pct": 67.42,
+  "worst_month_pct": -5.22
+}
