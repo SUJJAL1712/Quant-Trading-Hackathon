@@ -2,8 +2,7 @@
 Order Executor — Roostoo Trade Execution
 ==========================================
 Converts target weights -> Roostoo API orders.
-Handles order sizing, precision rounding, execution logging,
-and cost-aware order type selection (MARKET vs LIMIT).
+Handles order sizing, precision rounding, and execution logging.
 """
 
 import logging
@@ -15,11 +14,6 @@ from roostoo_client import RoostooClient
 
 logger = logging.getLogger(__name__)
 
-# Roostoo commission rates
-MAKER_FEE = 0.00008   # 0.008% for limit (maker) orders
-TAKER_FEE = 0.00012   # 0.012% for market (taker) orders
-AVG_FEE = 0.0001      # 0.01% average (for estimation)
-
 
 @dataclass
 class TradeOrder:
@@ -30,7 +24,6 @@ class TradeOrder:
     order_type: str = "MARKET"
     price: Optional[float] = None  # for LIMIT orders
     reason: str = ""        # why this trade was generated
-    urgency: str = "normal" # "urgent" (stop-loss, force exit) or "normal" (rebalance)
     # Filled by execution
     status: str = "PENDING"
     order_id: Optional[int] = None
@@ -39,105 +32,24 @@ class TradeOrder:
     commission: Optional[float] = None
 
 
-def estimate_round_trip_cost_bps(order_type: str = "MARKET") -> float:
-    """Estimate round-trip cost in basis points (entry + exit).
-
-    Includes commission both ways. MARKET orders also pay spread.
-    """
-    if order_type == "LIMIT":
-        # Maker fee both ways
-        return MAKER_FEE * 2 * 10000  # ~1.6 bps
-    else:
-        # Taker fee both ways + estimated spread cost (~2-5 bps for crypto)
-        return TAKER_FEE * 2 * 10000 + 3.0  # ~5.4 bps
-
-
 class TradeExecutor:
     """Generate and execute orders on Roostoo.
 
     Pipeline:
     1. Compare current holdings vs target weights
-    2. Filter by cost-aware threshold (alpha must exceed round-trip cost)
-    3. Choose order type: LIMIT for non-urgent, MARKET for urgent
-    4. Generate sell orders first (free up capital)
-    5. Generate buy orders (use freed capital)
-    6. Execute all orders via Roostoo API
+    2. Generate sell orders first (free up capital)
+    3. Generate buy orders (use freed capital)
+    4. Execute all orders via Roostoo API
     """
 
     def __init__(self, client: RoostooClient = None):
         self.client = client or RoostooClient()
         self.trade_log: List[TradeOrder] = []
-        self._ticker_cache: Dict[str, Dict] = {}  # pair -> {MaxBid, MinAsk, LastPrice}
-
-    def refresh_ticker_cache(self):
-        """Fetch full ticker data with bid/ask spreads for all pairs."""
-        try:
-            data = self.client.ticker()
-            if isinstance(data, dict):
-                self._ticker_cache = data
-        except Exception as e:
-            logger.warning("Failed to refresh ticker cache: %s", e)
-
-    def _get_bid_ask(self, pair: str) -> tuple:
-        """Get best bid and ask for a pair.
-
-        Returns:
-            (bid, ask) tuple. Falls back to (last_price, last_price) if unavailable.
-        """
-        ticker = self._ticker_cache.get(pair, {})
-        bid = float(ticker.get("MaxBid", 0))
-        ask = float(ticker.get("MinAsk", 0))
-        last = float(ticker.get("LastPrice", 0))
-
-        # Validate: bid should be < ask, both > 0
-        if bid <= 0 or ask <= 0 or bid >= ask:
-            return (last, last)
-        return (bid, ask)
-
-    def _choose_order_type(self, side: str, pair: str, urgency: str,
-                           weight_change: float) -> tuple:
-        """Choose between MARKET and LIMIT order.
-
-        Returns:
-            (order_type, limit_price_or_None)
-
-        Strategy:
-        - Urgent orders (stop-loss, force exit, large rebalance): MARKET
-        - Normal rebalances: LIMIT at bid+1tick (buy) or ask-1tick (sell)
-          to capture maker rebate
-        """
-        if urgency == "urgent":
-            return ("MARKET", None)
-
-        # For small rebalances, use LIMIT to save on fees
-        bid, ask = self._get_bid_ask(pair)
-
-        if bid == 0 or ask == 0 or bid == ask:
-            # No spread data available — use MARKET
-            return ("MARKET", None)
-
-        # Get price precision for this pair
-        price = self.client.round_price(pair, bid)
-        tick = 10 ** (-self.client.get_pair_precision(pair)[0])
-
-        if side == "BUY":
-            # Post limit buy at bid + 1 tick (aggressive maker)
-            limit_price = self.client.round_price(pair, bid + tick)
-        else:
-            # Post limit sell at ask - 1 tick (aggressive maker)
-            limit_price = self.client.round_price(pair, ask - tick)
-
-        if limit_price <= 0:
-            return ("MARKET", None)
-
-        return ("LIMIT", limit_price)
 
     def generate_orders(self, current_holdings: Dict[str, float],
                         target_weights: Dict[str, float],
                         current_prices: Dict[str, float],
-                        portfolio_value: float,
-                        alpha_scores: Dict[str, float] = None,
-                        urgent_coins: set = None) -> List[TradeOrder]:
+                        portfolio_value: float) -> List[TradeOrder]:
         """Generate orders to move from current to target allocation.
 
         Args:
@@ -145,16 +57,13 @@ class TradeExecutor:
             target_weights: {coin: weight} target allocation (0 to 1)
             current_prices: {pair: price} current market prices
             portfolio_value: Total portfolio value in USD
-            alpha_scores: {coin: alpha_z_score} for cost-aware filtering
-            urgent_coins: set of coins that need urgent execution (stop-loss, etc.)
 
         Returns:
             List of TradeOrder objects (sells first, then buys)
         """
+        orders = []
         sells = []
         buys = []
-        urgent_coins = urgent_coins or set()
-        alpha_scores = alpha_scores or {}
 
         min_trade = cfg.REBALANCE.min_trade_value_usd
 
@@ -174,57 +83,26 @@ class TradeExecutor:
 
             diff_qty = target_qty - current_qty
             diff_value = abs(diff_qty * price)
-            force_exit = (target_weight <= 1e-8 and current_qty > 0
-                          and current_value >= min_trade)
 
             # Skip if change is too small
             weight_change = abs(target_weight - current_weight)
-            if diff_value < min_trade:
+            if diff_value < min_trade or weight_change < cfg.REBALANCE.min_weight_change:
                 continue
-            if not force_exit and weight_change < cfg.REBALANCE.min_weight_change:
-                continue
-
-            # Cost-aware filter: skip trades where expected alpha
-            # doesn't justify the round-trip cost
-            is_urgent = (coin in urgent_coins or force_exit)
-            if not is_urgent and alpha_scores and coin in alpha_scores:
-                alpha_z = abs(alpha_scores[coin])
-                # Alpha z-score ~ expected excess return in std units
-                # Convert to approximate bps: z=1.0 ~ 50bps per rebalance period
-                expected_alpha_bps = alpha_z * 50.0
-                round_trip_bps = estimate_round_trip_cost_bps("LIMIT")
-
-                # Only trade if expected alpha exceeds cost by at least 2x
-                # (to account for estimation error)
-                if expected_alpha_bps < round_trip_bps * 2.0 and not force_exit:
-                    logger.debug("Skipping %s: alpha %.1f bps < 2x cost %.1f bps",
-                                 coin, expected_alpha_bps, round_trip_bps)
-                    continue
 
             # Round quantity to exchange precision
             rounded_qty = self.client.round_quantity(pair, abs(diff_qty))
             if rounded_qty <= 0:
                 continue
 
-            # Determine urgency
-            urgency = "urgent" if is_urgent else "normal"
-
-            # Choose order type
-            side = "SELL" if diff_qty < 0 else "BUY"
-            order_type, limit_price = self._choose_order_type(
-                side, pair, urgency, weight_change)
-
             if diff_qty < 0:
                 # Need to sell
+                # Don't sell more than we have
                 sell_qty = min(rounded_qty, current_qty)
                 if sell_qty > 0:
                     sells.append(TradeOrder(
                         pair=pair,
                         side="SELL",
                         quantity=sell_qty,
-                        order_type=order_type,
-                        price=limit_price,
-                        urgency=urgency,
                         reason=f"rebalance: {current_weight:.1%} -> {target_weight:.1%}",
                     ))
             else:
@@ -233,14 +111,12 @@ class TradeExecutor:
                     pair=pair,
                     side="BUY",
                     quantity=rounded_qty,
-                    order_type=order_type,
-                    price=limit_price,
-                    urgency=urgency,
                     reason=f"rebalance: {current_weight:.1%} -> {target_weight:.1%}",
                 ))
 
         # Sells first (free up capital), then buys
-        return sells + buys
+        orders = sells + buys
+        return orders
 
     def execute_orders(self, orders: List[TradeOrder]) -> List[TradeOrder]:
         """Execute a list of orders via Roostoo API.
@@ -253,13 +129,21 @@ class TradeExecutor:
         """
         for order in orders:
             try:
-                result = self.client.place_order(
-                    pair=order.pair,
-                    side=order.side,
-                    quantity=order.quantity,
-                    order_type=order.order_type,
-                    price=order.price,
-                )
+                if order.order_type == "MARKET":
+                    result = self.client.place_order(
+                        pair=order.pair,
+                        side=order.side,
+                        quantity=order.quantity,
+                        order_type="MARKET",
+                    )
+                else:
+                    result = self.client.place_order(
+                        pair=order.pair,
+                        side=order.side,
+                        quantity=order.quantity,
+                        order_type="LIMIT",
+                        price=order.price,
+                    )
 
                 order.order_id = result.get("OrderID")
                 order.status = result.get("Status", "UNKNOWN")
@@ -328,16 +212,10 @@ class TradeExecutor:
         total = buy_value + sell_value
         turnover_pct = total / portfolio_value if portfolio_value > 0 else 0
 
-        # Estimate commission savings from limit orders
-        n_limit = sum(1 for o in orders if o.order_type == "LIMIT")
-        n_market = sum(1 for o in orders if o.order_type == "MARKET")
-
         return {
             "buy_value_usd": buy_value,
             "sell_value_usd": sell_value,
             "total_value_usd": total,
             "turnover_pct": turnover_pct,
             "n_orders": len(orders),
-            "n_limit_orders": n_limit,
-            "n_market_orders": n_market,
         }

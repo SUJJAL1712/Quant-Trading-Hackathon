@@ -124,24 +124,22 @@ if compare_enabled and len(options) > 1:
 st.sidebar.markdown("---")
 st.sidebar.subheader("Strategy Info")
 st.sidebar.markdown("""
-**Regime Detection:** Trend-based
-- BTC price vs 7d/3d SMA + breadth + vol spike
-- 8h hysteresis, crash override
-- Recalculated every **2 hours**
+**Regime Detection:** Trend-based (not HMM)
+- BTC price vs 7d/3d SMA
+- SMA slope + drawdown + 24h momentum
+- 24h hysteresis (min 6 cycles)
+- Recalculated every **4 hours**
 
-**Rebalance Frequency:** Every **2 hours** (24/7)
+**Rebalance Frequency:** Every **4 hours** (24/7)
 
-**Signals (6):**
-1. Momentum -- 12h/72h/168h
-2. Breakout -- 72h range
-3. VolumeMomentum
-4. MeanReversion -- RSI gate
-5. RelativeStrength -- vs BTC
-6. ResidualMomentum -- beta-adjusted
+**Signals (5):**
+1. Momentum (35%) -- 12h/72h/168h
+2. Breakout (20%) -- 72h range
+3. VolumeMomentum (15%)
+4. MeanReversion (15%) -- RSI gate
+5. RelativeStrength (15%) -- vs BTC
 
 **Optimizer:** BL + HRP blend (regime-dependent)
-
-**Protection:** 7-signal cash shield (drawdown, trend, breadth, vol, corr, momentum, DD velocity)
 """)
 
 # ── Load data ──

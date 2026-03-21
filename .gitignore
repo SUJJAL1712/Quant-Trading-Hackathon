@@ -1,7 +1,9 @@
 # Data files
-data/csv/
-data/db/
+data/csv/*.csv
+data/csv/*.json
+data/db/*.db
 data/bot_state.json
+*.db
 
 # Python
 __pycache__/
