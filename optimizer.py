@@ -338,6 +338,19 @@ class PortfolioOptimizer:
             # old names and violate position/invested limits)
             combined = self._enforce_constraints(smoothed)
 
+        # ── Force TRX to fixed allocation ──
+        # TRX has 0.19 avg cross-correlation — best portfolio diversifier.
+        # Always hold it at fixed weight regardless of signals.
+        trx_fixed = cfg.RISK.trx_fixed_weight
+        if trx_fixed > 0 and "TRX" in combined.index or trx_fixed > 0:
+            total_before = combined.sum()
+            # Scale other coins down to make room for TRX
+            non_trx = combined.drop("TRX", errors="ignore")
+            remaining = max(total_before - trx_fixed, 0.05)
+            if non_trx.sum() > 0:
+                non_trx = non_trx * (remaining / non_trx.sum())
+            combined = pd.concat([non_trx, pd.Series({"TRX": trx_fixed})])
+
         self._prev_weights = combined.copy()
 
         diagnostics = {

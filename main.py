@@ -549,6 +549,14 @@ class BacktestEngine:
         # Stop-loss cooldown: {coin: cycles_remaining}
         self._stop_cooldown: Dict[str, int] = {}
         self._STOP_COOLDOWN_CYCLES = 6  # 6 rebalance cycles = 24h cooldown
+        self._stop_triggered_skip_next = False  # skip next rebalance if stop fired
+
+        # 5DMA breakout addon tracking: {coin: {qty, sma_at_buy}}
+        self._sma_addon: Dict[str, Dict] = {}
+        # Track whether each coin was below 5DMA last hour (to detect crossover)
+        self._was_below_5dma: Dict[str, bool] = {}
+        # Track whether 3DMA early exit already fired (only reduce once per trend)
+        self._early_exit_fired: Dict[str, bool] = {}
 
         # Results tracking
         self.nav_series: List[Tuple[pd.Timestamp, float]] = []
@@ -780,6 +788,185 @@ class BacktestEngine:
             self.risk_mgr.update_nav(nav)
             self.nav_series.append((ts, nav))
 
+            # ── Intra-rebalance stop-loss: check EVERY hour ──
+            if cfg.RISK.intra_stop_enabled and self.holdings:
+                stop_pct = cfg.RISK.intra_stop_loss_pct
+                stopped_coins = []
+                for coin, qty in list(self.holdings.items()):
+                    if coin in self._stop_cooldown:
+                        continue
+                    entry = self.entry_prices.get(coin)
+                    price = current_prices.get(coin, 0)
+                    if entry and price > 0:
+                        drop = (price - entry) / entry
+                        if drop <= -stop_pct:
+                            # Immediate sell
+                            proceeds = qty * price
+                            commission = proceeds * self.COMMISSION_RATE
+                            self.cash += proceeds - commission
+                            self.trade_log.append({
+                                "timestamp": str(ts),
+                                "pair": f"{coin}/USD", "side": "SELL",
+                                "quantity": qty, "price": price,
+                                "value": proceeds, "commission": commission,
+                            })
+                            stopped_coins.append(coin)
+                            total_trades += 1
+                            logger.info("  INTRA-STOP %s: entry=%.4f now=%.4f (%.1f%% drop)",
+                                        coin, entry, price, drop * 100)
+
+                for coin in stopped_coins:
+                    self.holdings.pop(coin, None)
+                    self.entry_prices.pop(coin, None)
+                    self._stop_cooldown[coin] = self._STOP_COOLDOWN_CYCLES
+                    self.risk_mgr.reset_position_hwm(coin)
+
+                if stopped_coins:
+                    self._stop_triggered_skip_next = True
+
+            # ── 3DMA early exit: sell 20% when price breaks below 3DMA ──
+            if cfg.RISK.sma_early_exit_enabled and self.holdings:
+                early_window = cfg.RISK.sma_early_exit_hours
+                trim_pct = cfg.RISK.sma_early_exit_pct
+                for coin, qty in list(self.holdings.items()):
+                    if coin in self._stop_cooldown:
+                        continue
+                    if self._early_exit_fired.get(coin, False):
+                        continue  # already trimmed this trend
+                    price = current_prices.get(coin, 0)
+                    if price <= 0 or coin not in close_prices.columns:
+                        continue
+                    coin_prices = close_prices.loc[:ts, coin].dropna()
+                    if len(coin_prices) < early_window:
+                        continue
+                    sma_3d = coin_prices.iloc[-early_window:].mean()
+                    if price < sma_3d:
+                        # Price broke below 3DMA — sell 20% of position
+                        sell_qty = qty * trim_pct
+                        if sell_qty * price < cfg.REBALANCE.min_trade_value_usd:
+                            continue
+                        proceeds = sell_qty * price
+                        commission = proceeds * self.COMMISSION_RATE
+                        self.cash += proceeds - commission
+                        self.holdings[coin] = qty - sell_qty
+                        self._early_exit_fired[coin] = True
+                        total_trades += 1
+                        self.trade_log.append({
+                            "timestamp": str(ts),
+                            "pair": f"{coin}/USD", "side": "SELL",
+                            "quantity": sell_qty, "price": price,
+                            "value": proceeds, "commission": commission,
+                        })
+                        logger.info("  3DMA-TRIM %s: sold 20%% ($%.0f) at %.4f < 3DMA=%.4f",
+                                    coin, proceeds, price, sma_3d)
+                    else:
+                        # Price back above 3DMA — reset so trim can fire again next break
+                        self._early_exit_fired[coin] = False
+
+            # ── 5DMA trend exit: sell ANY holding that breaks below 5DMA ──
+            if cfg.RISK.sma_profit_protect_enabled and self.holdings:
+                sma_window = cfg.RISK.sma_profit_protect_hours  # 120h = 5 days
+                sma_exits = []
+                for coin, qty in list(self.holdings.items()):
+                    if coin in self._stop_cooldown:
+                        continue
+                    price = current_prices.get(coin, 0)
+                    if price <= 0:
+                        continue
+                    # Compute 5DMA from close_prices
+                    if coin in close_prices.columns:
+                        coin_prices = close_prices.loc[:ts, coin].dropna()
+                        if len(coin_prices) >= sma_window:
+                            sma_val = coin_prices.iloc[-sma_window:].mean()
+                            if price < sma_val:
+                                # Price broke below 5DMA — sell regardless of P&L
+                                proceeds = qty * price
+                                commission = proceeds * self.COMMISSION_RATE
+                                self.cash += proceeds - commission
+                                entry = self.entry_prices.get(coin, price)
+                                pct_change = (price - entry) / entry * 100
+                                self.trade_log.append({
+                                    "timestamp": str(ts),
+                                    "pair": f"{coin}/USD", "side": "SELL",
+                                    "quantity": qty, "price": price,
+                                    "value": proceeds, "commission": commission,
+                                })
+                                sma_exits.append(coin)
+                                total_trades += 1
+                                logger.info("  5DMA-EXIT %s: entry=%.4f now=%.4f (%+.1f%%) < 5DMA=%.4f",
+                                            coin, entry, price, pct_change, sma_val)
+
+                for coin in sma_exits:
+                    self.holdings.pop(coin, None)
+                    self.entry_prices.pop(coin, None)
+                    self._sma_addon.pop(coin, None)
+                    self._was_below_5dma.pop(coin, None)
+                    self._early_exit_fired.pop(coin, None)
+
+            # ── 5DMA breakout addon: buy 20% more on crossover, sell at SMA level ──
+            if cfg.RISK.sma_addon_enabled and self.holdings:
+                sma_window = cfg.RISK.sma_profit_protect_hours
+                for coin, qty in list(self.holdings.items()):
+                    if coin in self._stop_cooldown:
+                        continue
+                    price = current_prices.get(coin, 0)
+                    if price <= 0 or coin not in close_prices.columns:
+                        continue
+                    coin_prices = close_prices.loc[:ts, coin].dropna()
+                    if len(coin_prices) < sma_window:
+                        continue
+                    sma_val = coin_prices.iloc[-sma_window:].mean()
+                    is_below = price < sma_val
+
+                    # Check for crossover: was below, now above
+                    was_below = self._was_below_5dma.get(coin, True)
+                    self._was_below_5dma[coin] = is_below
+
+                    if was_below and not is_below and coin not in self._sma_addon:
+                        # Just crossed above 5DMA — buy 20% more of current invested value
+                        invested_value = qty * price
+                        addon_value = invested_value * 0.20
+                        if addon_value >= cfg.REBALANCE.min_trade_value_usd and addon_value <= self.cash:
+                            addon_qty = addon_value / price
+                            commission = addon_value * self.COMMISSION_RATE
+                            self.cash -= (addon_value + commission)
+                            self.holdings[coin] = qty + addon_qty
+                            self._sma_addon[coin] = {"qty": addon_qty, "sma_at_buy": sma_val}
+                            total_trades += 1
+                            self.trade_log.append({
+                                "timestamp": str(ts),
+                                "pair": f"{coin}/USD", "side": "BUY",
+                                "quantity": addon_qty, "price": price,
+                                "value": addon_value, "commission": commission,
+                            })
+                            logger.info("  5DMA-ADDON BUY %s: +20%% ($%.0f) at %.4f, SMA=%.4f",
+                                        coin, addon_value, price, sma_val)
+
+                    # Check if addon should be sold: price dropped back to SMA at time of addon buy
+                    if coin in self._sma_addon:
+                        addon = self._sma_addon[coin]
+                        if price <= addon["sma_at_buy"]:
+                            # Sell just the addon portion
+                            sell_qty = min(addon["qty"], self.holdings.get(coin, 0))
+                            if sell_qty > 0:
+                                proceeds = sell_qty * price
+                                commission = proceeds * self.COMMISSION_RATE
+                                self.cash += proceeds - commission
+                                self.holdings[coin] = self.holdings.get(coin, 0) - sell_qty
+                                if self.holdings[coin] < 1e-10:
+                                    self.holdings.pop(coin, None)
+                                    self.entry_prices.pop(coin, None)
+                                total_trades += 1
+                                self.trade_log.append({
+                                    "timestamp": str(ts),
+                                    "pair": f"{coin}/USD", "side": "SELL",
+                                    "quantity": sell_qty, "price": price,
+                                    "value": proceeds, "commission": commission,
+                                })
+                                logger.info("  5DMA-ADDON SELL %s: addon at %.4f, SMA was %.4f",
+                                            coin, price, addon["sma_at_buy"])
+                            del self._sma_addon[coin]
+
             # Check if it's time to rebalance
             should_rebalance = False
             if last_rebalance_ts is None:
@@ -790,6 +977,28 @@ class BacktestEngine:
                     should_rebalance = True
 
             if not should_rebalance:
+                continue
+
+            # If a stop-loss fired since last rebalance, skip this one
+            if self._stop_triggered_skip_next:
+                logger.info("  [%s] Skipping rebalance — stop-loss triggered, holding until next period",
+                            ts.strftime("%Y-%m-%d %H:%M"))
+                self._stop_triggered_skip_next = False
+                last_rebalance_ts = ts
+                rebalance_count += 1
+                # Still log the snapshot
+                regime_names = {0: "BULL", 1: "NEUTRAL", 2: "BEAR"}
+                self.portfolio_log.append({
+                    "timestamp": str(ts),
+                    "nav_usd": nav,
+                    "cash_usd": self.cash,
+                    "n_positions": len(self.holdings),
+                    "invested_pct": 1 - (self.cash / nav) if nav > 0 else 0,
+                    "regime": regime_names.get(self.alpha_engine.current_regime, "UNKNOWN"),
+                    "drawdown": self.risk_mgr.current_drawdown,
+                    "max_drawdown": self.risk_mgr.max_drawdown,
+                    "n_trades": 0,
+                })
                 continue
 
             # Get lookback window for signals
