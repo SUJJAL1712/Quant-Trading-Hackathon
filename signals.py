@@ -345,9 +345,9 @@ class TrendRegimeDetector:
         self._regime_history = []
         self._regime_hold_count = 0
         freq = rebalance_hours or cfg.REBALANCE.frequency_hours
-        self._MIN_HOLD = max(2, 16 // freq)  # ~16h hysteresis (was 8h)
-        # Re-risk cooldown: after leaving BEAR, require extra hold before BULL
-        self._RERISK_COOLDOWN = max(1, 12 // freq)  # 12h cooldown (was 24h)
+        self._MIN_HOLD = max(2, 10 // freq)  # ~10h hysteresis (reduced from 16h)
+        # Re-risk cooldown: after leaving BEAR, brief check before BULL
+        self._RERISK_COOLDOWN = max(1, 6 // freq)  # 6h cooldown (reduced from 12h)
         self._bear_exit_count = 0  # cycles since last BEAR exit
         self._was_bear = False     # track if we were recently in BEAR
 
@@ -511,6 +511,60 @@ class TrendRegimeDetector:
     @property
     def current_regime(self) -> int:
         return self._current_regime
+
+    def trend_strength(self, prices: pd.DataFrame, benchmark: str = None) -> float:
+        """Continuous trend strength score in [-1, 1].
+
+        Based on Baltas & Kosowski (2020) "Demystifying Time-Series Momentum":
+        combines normalized trend signals across multiple horizons for a
+        smooth, continuous measure rather than discrete regime buckets.
+
+        Returns:
+            float: -1 = max bearish, 0 = neutral, +1 = max bullish
+        """
+        benchmark = benchmark or cfg.BENCHMARK
+        if benchmark not in prices.columns or len(prices) < 168:
+            return 0.0
+
+        btc = prices[benchmark]
+        score = 0.0
+        n_signals = 0
+
+        # 1. Price vs SMAs (normalized distance)
+        for window in [72, 168]:
+            sma = compute_sma(btc, window)
+            if len(sma) > 0 and sma.iloc[-1] > 0:
+                dist = (btc.iloc[-1] / sma.iloc[-1]) - 1.0
+                # Normalize: ±5% from SMA → ±1.0
+                score += np.clip(dist / 0.05, -1.0, 1.0)
+                n_signals += 1
+
+        # 2. Multi-horizon momentum (24h, 72h, 168h)
+        for hours, norm in [(24, 0.03), (72, 0.06), (168, 0.10)]:
+            if len(btc) > hours:
+                mom = btc.iloc[-1] / btc.iloc[-hours] - 1.0
+                score += np.clip(mom / norm, -1.0, 1.0)
+                n_signals += 1
+
+        # 3. Drawdown penalty (asymmetric: penalize DD more)
+        recent_high = btc.iloc[-336:].max() if len(btc) >= 336 else btc.max()
+        dd = (recent_high - btc.iloc[-1]) / recent_high if recent_high > 0 else 0
+        if dd > 0.03:
+            dd_score = -np.clip((dd - 0.03) / 0.10, 0, 1.0)
+            score += dd_score
+            n_signals += 1
+
+        # 4. Market breadth
+        if len(prices) >= 72 and len(prices.columns) >= 5:
+            sma_72_all = prices.rolling(72, min_periods=36).mean()
+            breadth = float((prices.iloc[-1] > sma_72_all.iloc[-1]).mean())
+            score += np.clip((breadth - 0.5) / 0.25, -1.0, 1.0)
+            n_signals += 1
+
+        if n_signals > 0:
+            score /= n_signals
+
+        return float(np.clip(score, -1.0, 1.0))
 
     def generate_tilt(self, returns: pd.DataFrame, regime: int,
                       benchmark: str = None) -> pd.Series:
@@ -998,18 +1052,14 @@ class AlphaEngine:
             else:
                 alpha[below_trend] *= 0.1
 
-        # Bear quality filter: in BEAR only, softly penalize meme/speculative.
-        # Don't hard-cap — just apply a multiplier so they rank lower but
-        # can still be held if alpha is strong enough.
+        # Asset-class-aware bear filter: in BEAR, apply per-class alpha multiplier.
+        # Large-cap gets no penalty (flight to quality), meme/micro get heavy penalty.
+        # Uses the asset class system from config instead of hardcoded sector checks.
         if regime == 2:
-            MEME_SECTOR = {"Meme"}
-
             for coin in coins:
-                sector = cfg.SECTOR_MAP.get(coin, "Other")
-                if sector in MEME_SECTOR:
-                    alpha[coin] = alpha.get(coin, 0) * 0.5  # halve meme alpha in bear
-                elif sector in {"DeSci", "Identity", "Privacy"}:
-                    alpha[coin] = alpha.get(coin, 0) * 0.7  # reduce speculative alpha
+                bear_mult = cfg.get_class_param(coin, "bear_alpha_mult", 1.0)
+                if bear_mult < 1.0:
+                    alpha[coin] = alpha.get(coin, 0) * bear_mult
 
         # Final z-score
         alpha = zscore(alpha)
@@ -1040,6 +1090,15 @@ class AlphaEngine:
     def regime_name(self) -> str:
         names = {0: "BULL", 1: "NEUTRAL", 2: "BEAR"}
         return names.get(self.current_regime, "UNKNOWN")
+
+    def get_trend_strength(self, prices: pd.DataFrame) -> float:
+        """Get continuous trend strength from regime detector.
+
+        Only works with TrendRegimeDetector; other detectors return 0.0.
+        """
+        if hasattr(self.regime_detector, 'trend_strength'):
+            return self.regime_detector.trend_strength(prices)
+        return 0.0
 
     @property
     def adaptive_diagnostics(self) -> Dict:

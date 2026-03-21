@@ -383,12 +383,14 @@ class TradingBot:
             regime_name = "BEAR"  # Keep name in sync with override
 
         # 7. Optimize portfolio
+        ts = self.alpha_engine.get_trend_strength(close_prices)
         target_weights, diagnostics = self.optimizer.optimize(
             alpha_scores=alpha_scores,
             returns=returns,
             regime=regime,
             current_drawdown=self.risk_mgr.current_drawdown,
             prices=close_prices,
+            trend_strength=ts,
         )
 
         logger.info("Target weights: %s", target_weights.to_dict())
@@ -575,15 +577,10 @@ class BacktestEngine:
     # Commission rate matching Roostoo (maker 0.008% + taker 0.012%)
     COMMISSION_RATE = 0.0001  # 0.01% per side (Roostoo is very low fee)
 
-    # Slippage model: bps of adverse price movement per trade
+    # Slippage model: uses per-asset-class bps from config.ASSET_CLASS_PARAMS
     # Accounts for bid-ask spread crossing + market impact
-    # Conservative: 2 bps for large-cap, up to 5 bps for small-cap
-    SLIPPAGE_BPS = 2.0  # basis points (0.02%)
-
-    # Large-cap coins get less slippage, small-cap more
-    LOW_SLIPPAGE_COINS = {"BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA"}
-    HIGH_SLIPPAGE_COINS = {"VIRTUAL", "BIO", "OPEN", "FORM", "OMNI", "S",
-                           "PENGU", "TRUMP", "WIF", "BONK", "FLOKI"}
+    # Large-cap: 1 bps, mid-cap: 2 bps, small-cap: 3 bps, meme: 4 bps, micro: 5 bps
+    SLIPPAGE_BPS_DEFAULT = 2.0  # fallback if class lookup fails
 
     def __init__(self, start: str, end: str, initial_capital: float = None,
                  rebalance_hours: int = None, adaptive: bool = True):
@@ -606,6 +603,11 @@ class BacktestEngine:
         # Stop-loss cooldown: {coin: cycles_remaining}
         self._stop_cooldown: Dict[str, int] = {}
         self._STOP_COOLDOWN_CYCLES = max(6, 24 // max(self.rebalance_hours, 1))
+
+        # Loss cooldown: prevent rapid re-entry after selling at a loss
+        # {coin: cycles_remaining} — dampens alpha for recent losers
+        self._loss_cooldown: Dict[str, int] = {}
+        self._LOSS_COOLDOWN_CYCLES = max(3, 12 // max(self.rebalance_hours, 1))
 
         # Results tracking
         self.nav_series: List[Tuple[pd.Timestamp, float]] = []
@@ -770,12 +772,8 @@ class BacktestEngine:
         return self.cash + holdings_value
 
     def _get_slippage_bps(self, coin: str) -> float:
-        """Get slippage in basis points based on coin liquidity tier."""
-        if coin in self.LOW_SLIPPAGE_COINS:
-            return self.SLIPPAGE_BPS * 0.5   # 1 bps for large-cap
-        elif coin in self.HIGH_SLIPPAGE_COINS:
-            return self.SLIPPAGE_BPS * 2.5   # 5 bps for small-cap
-        return self.SLIPPAGE_BPS              # 2 bps default
+        """Get slippage in basis points based on asset class."""
+        return cfg.get_class_param(coin, "slippage_bps", self.SLIPPAGE_BPS_DEFAULT)
 
     def _apply_slippage(self, price: float, side: str, coin: str) -> float:
         """Apply slippage to a trade price.
@@ -863,6 +861,10 @@ class BacktestEngine:
             self.cash += proceeds - commission
             self.holdings[coin] = self.holdings.get(coin, 0) - sell_qty
             if self.holdings[coin] < 1e-10:
+                # Full exit — check if we sold at a loss
+                entry = self.entry_prices.get(coin, exec_price)
+                if exec_price < entry * 0.995:  # >0.5% loss triggers cooldown
+                    self._loss_cooldown[coin] = self._LOSS_COOLDOWN_CYCLES
                 self.holdings.pop(coin, None)
                 self.entry_prices.pop(coin, None)
             trades += 1
@@ -1069,18 +1071,38 @@ class BacktestEngine:
                 # Reset HWM so re-entry starts fresh
                 self.risk_mgr.reset_position_hwm(coin)
 
-            # Prevent re-entry for coins on cooldown
+            # Prevent re-entry for coins on stop-loss cooldown
             for coin in self._stop_cooldown:
                 if coin in alpha_scores.index:
                     alpha_scores[coin] = min(alpha_scores[coin], -1.0)
 
-            # Optimize
+            # Decrement loss cooldowns (tracked but not used for alpha dampening
+            # — position hysteresis in optimizer handles this better)
+            for coin in list(self._loss_cooldown):
+                self._loss_cooldown[coin] -= 1
+                if self._loss_cooldown[coin] <= 0:
+                    del self._loss_cooldown[coin]
+
+            # Compute portfolio returns for protective allocation
+            # (uses actual portfolio performance instead of BTC proxy)
+            port_returns = None
+            if len(self.nav_series) >= 8:
+                recent_navs = pd.Series(
+                    [n for _, n in self.nav_series[-24:]],
+                    index=[t for t, _ in self.nav_series[-24:]])
+                port_returns = np.log(recent_navs / recent_navs.shift(1)).dropna()
+
+            # Optimize — pass continuous trend strength for exposure scaling
+            trend_str = self.alpha_engine.get_trend_strength(lookback_data)
+            # Pass portfolio returns to protection engine via optimizer
+            self.optimizer.protection_engine._portfolio_returns = port_returns
             target_weights, diagnostics = self.optimizer.optimize(
                 alpha_scores=alpha_scores,
                 returns=lookback_returns,
                 regime=regime,
                 current_drawdown=self.risk_mgr.current_drawdown,
                 prices=lookback_data,
+                trend_strength=trend_str,
             )
 
             if target_weights.empty:
