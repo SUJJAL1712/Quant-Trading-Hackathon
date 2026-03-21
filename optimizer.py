@@ -183,7 +183,7 @@ class PortfolioOptimizer:
 
     # Regime-dependent blending ratios (invested target now set by trend_strength)
     REGIME_BLEND = {
-        0: {"bl_ratio": 0.80, "view_conf": 0.08, "vol_scale_range": (0.65, 1.5)},
+        0: {"bl_ratio": 0.60, "view_conf": 0.10, "vol_scale_range": (0.65, 1.5)},  # Optuna: more HRP diversification, stronger alpha conviction
         1: {"bl_ratio": 0.50, "view_conf": 0.05, "vol_scale_range": (0.45, 1.2)},
         2: {"bl_ratio": 0.25, "view_conf": 0.02, "vol_scale_range": (0.25, 0.8)},
     }
@@ -192,16 +192,16 @@ class PortfolioOptimizer:
     # Based on Baltas & Kosowski (2020): scale exposure proportionally to trend conviction
     # trend_strength ∈ [-1, 1] maps to [BEAR_FLOOR, BULL_CEILING]
     TREND_INVESTED_FLOOR = 0.18   # minimum invested even in max bear
-    TREND_INVESTED_CEILING = 0.80  # maximum invested in max bull
-    TREND_INVESTED_NEUTRAL = 0.45  # invested when trend_strength = 0
+    TREND_INVESTED_CEILING = 0.85  # Optuna (was 0.80): slightly more invested in strong bull
+    TREND_INVESTED_NEUTRAL = 0.55  # Optuna (was 0.45): hold more in neutral regime
 
     # Asymmetric smoothing: delever fast, re-lever at regime-appropriate speed
     # Research: Moskowitz et al. (2012) "Time Series Momentum" — delayed re-entry
     # destroys more alpha than it saves in whipsaw avoidance
-    SMOOTHING_ALPHA_DELEVER = 0.85   # 85% toward target when reducing exposure (fast de-risk)
+    SMOOTHING_ALPHA_DELEVER = 0.75   # Optuna (was 0.85): deleverage faster
     SMOOTHING_ALPHA_RELEVER = {
-        0: 0.55,   # Bull: re-lever moderately fast (confirmed trend)
-        1: 0.40,   # Neutral: cautious
+        0: 0.70,   # Optuna (was 0.55): re-lever fast in bull
+        1: 0.45,   # Optuna (was 0.40): slightly faster in neutral
         2: 0.30,   # Bear: slow re-lever (bear rallies are traps)
     }
 
@@ -291,7 +291,7 @@ class PortfolioOptimizer:
             if coin in alpha_adj.index and alpha_adj[coin] > -0.5:
                 # Held coins with non-terrible alpha get a persistence bonus
                 # Reduces churn by making it harder to cycle positions
-                alpha_adj[coin] += 0.10
+                alpha_adj[coin] += getattr(self, '_hysteresis_bonus', 0.08)  # Optuna (was 0.10)
 
         top_coins = alpha_adj.nlargest(max_hold)
         # Only include coins with positive adjusted alpha

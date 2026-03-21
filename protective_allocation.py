@@ -48,7 +48,7 @@ class ProtectiveAllocConfig:
     # -- Signal 2: Portfolio Return (dual window: 6h main + 3h fast) --
     # Fires when portfolio drops more than threshold in either window
     portfolio_ret_window: int = 6        # 6-hour return lookback (main)
-    portfolio_ret_threshold: float = -0.008  # -0.8% in 6h = fire
+    portfolio_ret_threshold: float = -0.007  # Optuna (was -0.008): more sensitive to drops
     portfolio_ret_crisis: float = -0.025     # -2.5% in 6h = crisis (score=1.0)
     portfolio_ret_fast_window: int = 3   # 3-hour return (fast detector)
     portfolio_ret_fast_threshold: float = -0.006  # -0.6% in 3h = fire
@@ -59,8 +59,8 @@ class ProtectiveAllocConfig:
 
     # -- Protection intensity --
     min_invested_override: float = 0.15   # floor: never below 15% invested
-    protection_smoothing_up: float = 0.70   # fast ramp UP to protect (respond quickly to stress)
-    protection_smoothing_down: float = 0.30 # slower ramp DOWN to re-enter (avoid whipsaws)
+    protection_smoothing_up: float = 0.90   # Optuna (was 0.70): near-instant protection ramp
+    protection_smoothing_down: float = 0.25 # Optuna (was 0.30): slightly slower re-entry
 
     # -- Circuit breaker: if both signals fire simultaneously --
     circuit_breaker_both: bool = True     # skip smoothing if both fire
@@ -162,7 +162,8 @@ class ProtectiveAllocationEngine:
         both_fired = vol_fired and port_fired
         circuit_breaker = both_fired and self.config.circuit_breaker_both
         # Rapid deterioration: raw score jumped >0.3 above smoothed → skip smoothing
-        rapid_deterioration = (raw_score - self._prev_protection_score) > 0.3
+        rapid_threshold = getattr(self, '_rapid_deterioration_threshold', 0.30)
+        rapid_deterioration = (raw_score - self._prev_protection_score) > rapid_threshold
 
         if circuit_breaker or rapid_deterioration:
             smoothed = max(raw_score, self._prev_protection_score)

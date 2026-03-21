@@ -253,19 +253,19 @@ class PortfolioConstraints:
 
 @dataclass
 class RiskParams:
-    target_volatility: float = 0.55             # crypto vol is 50-80% annualized; 55% allows adequate exposure
+    target_volatility: float = 0.45             # Optuna-optimized (was 0.55): tighter vol = less wild swings
     max_drawdown: float = 0.15                  # 15% max drawdown (realistic for crypto)
     var_confidence: float = 0.95
     lookback_risk_days: int = 90                # 90 days for risk estimation (crypto moves fast)
     vol_scaling: bool = True
     drawdown_deleveraging: bool = True
-    dd_deleverage_start: float = 0.08           # start deleveraging at 8% DD (crypto-realistic)
-    dd_deleverage_full: float = 0.18            # full deleverage by 18% DD
-    position_stop_loss_pct: float = 0.12        # 12% per-position trailing stop
+    dd_deleverage_start: float = 0.07           # Optuna (was 0.08): deleverage slightly earlier
+    dd_deleverage_full: float = 0.15            # Optuna (was 0.18): full deleverage at 15% DD
+    position_stop_loss_pct: float = 0.09        # Optuna (was 0.12): tighter stops, cut losers faster
     correlation_spike_threshold: float = 0.85   # crypto always has elevated corr; only panic at 0.85
 
     # ── Dynamic Risk Aversion (λ) Scaling ──
-    lambda_base: float = 2.5                    # baseline BL risk aversion
+    lambda_base: float = 1.5                    # Optuna (was 2.5): less risk aversion, more aggressive
     lambda_corr_threshold: float = 0.60         # crypto baseline corr ~0.5; only scale above 0.60
     lambda_corr_sensitivity: float = 10.0       # κ: moderate correlation-driven scaling (was 25)
     lambda_dd_sensitivity: float = 3.0          # δ: moderate drawdown-driven scaling (was 6)
@@ -273,7 +273,7 @@ class RiskParams:
 
     # ── Enhanced Volatility Targeting ──
     vol_scale_cap: float = 1.0                  # NEVER lever up — only delever
-    ewma_cov_alpha: float = 0.30                # blend recent vol (lower = more stable)
+    ewma_cov_alpha: float = 0.45                # Optuna (was 0.30): more reactive to recent vol
 
     # ── ATR-Based Dynamic Stop-Losses ──
     atr_stop_multiplier: float = 2.5            # k × realized_vol = stop distance
@@ -330,7 +330,7 @@ class SignalParams:
 class RebalanceConfig:
     frequency_hours: int = 2            # rebalance every 2 hours (best risk-adj composite)
     min_trade_value_usd: float = 150.0  # minimum trade size (reduce small churn trades)
-    min_weight_change: float = 0.05     # don't trade if weight change < 5% (reduce churn)
+    min_weight_change: float = 0.04     # Optuna (was 0.05): slightly more responsive to changes
     max_turnover_pct: float = 0.35      # max 35% turnover per rebalance (was 40%)
 
 

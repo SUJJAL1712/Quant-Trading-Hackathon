@@ -583,7 +583,8 @@ class BacktestEngine:
     SLIPPAGE_BPS_DEFAULT = 2.0  # fallback if class lookup fails
 
     def __init__(self, start: str, end: str, initial_capital: float = None,
-                 rebalance_hours: int = None, adaptive: bool = True):
+                 rebalance_hours: int = None, adaptive: bool = True,
+                 save_results: bool = True):
         self.start = pd.Timestamp(start, tz="UTC")
         self.end = pd.Timestamp(end, tz="UTC")
         self.initial_capital = initial_capital or cfg.INITIAL_CAPITAL_USD
@@ -594,6 +595,7 @@ class BacktestEngine:
                                         rebalance_hours=self.rebalance_hours)
         self.optimizer = PortfolioOptimizer()
         self.risk_mgr = RiskManager()
+        self.save_results = save_results
 
         # State
         self.cash = self.initial_capital
@@ -1209,7 +1211,11 @@ class BacktestEngine:
         if self.alpha_engine.adaptive:
             summary["adaptive_diagnostics"] = self.alpha_engine.adaptive_diagnostics
 
-        # 4. Save results
+        # 4. Save results (skip during optimization to avoid clutter)
+        if not self.save_results:
+            summary["output_dir"] = None
+            return summary
+
         out_dir = os.path.join(cfg.CSV_DIR, f"backtest_{run_id}")
         os.makedirs(out_dir, exist_ok=True)
 
